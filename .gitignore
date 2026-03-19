@@ -1,0 +1,11 @@
+# Configuration and user-specific files
+DEV.md
+SYSTEM.md
+models.md
+settings.json
+
+# Secrets and local data
+auth.json
+sessions/
+models.json
+bin/

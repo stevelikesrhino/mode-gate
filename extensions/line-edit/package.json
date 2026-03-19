@@ -1,0 +1,16 @@
+{
+	"name": "pi-extension-line-edit",
+	"version": "1.0.0",
+	"type": "module",
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"diff": "^7.0.0"
+	},
+	"devDependencies": {
+		"@types/diff": "^6.0.0"
+	}
+}
