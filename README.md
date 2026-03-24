@@ -2,6 +2,14 @@
 
 为 [PI Coding Agent](https://github.com/badlogic/pi-mono) 设计的三模式权限控制系统，控制 AI 可以执行的操作。
 
+### 更新： 添加line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
+
+示例：
+> 喵喵喵喵is a cat
+> 汪汪汪汪is a dog
+
+编辑非常容易出错
+
 ## 模式
 
 | 模式 | 描述 | 状态颜色 |
@@ -69,13 +77,18 @@
 
 1. 安装 PI Coding Agent：`npm install -g @mariozechner/pi-coding-agent`
 2. 克隆此仓库
-3. 安装 line-edit 扩展依赖：`cd extensions/line-edit && npm install`
+3. 进入line-edit的页面并安装 line-edit 扩展依赖：`cd extensions/line-edit && npm install`
 4. 将扩展文件夹复制到你的 PI 扩展目录
 5. 在设置中启用
 
 ## 贡献
 
 欢迎提交 PR，但我只做功能开发——代码审查反正可能是 AI 做的。
+
+## 致谢
+
+- [oh-my-pi](https://github.com/nicholasgasior/oh-my-pi) — line-edit 扩展的 hashline 编辑和 diff 生成参考实现
+- [diff](https://www.npmjs.com/package/diff) — Myers diff 算法（BSD-3-Clause）
 
 ## 许可证
 
@@ -86,6 +99,14 @@ GPLv3
 # Mode Gate
 
 A three-mode permission control system for [PI Coding Agent](https://github.com/badlogic/pi-mono), controlling what the AI can do.
+
+### Update: Added line-edit — a line-number + hash based editing tool to work around Qwen3.5 + llama.cpp tokenizer issues that prevent correct matching of CJK+English old/new strings, making certain documents uneditable. Opus wrote most of the code. Opt out if you're not using CJK characters.
+
+Example:
+> 喵喵喵喵is a cat
+> 汪汪汪汪is a dog
+
+Editing is very error-prone
 
 ## Modes
 
@@ -154,13 +175,18 @@ The `skills/` folder contains personal workflow skills (init, load, save) for my
 
 1. Install PI Coding Agent: `npm install -g @mariozechner/pi-coding-agent`
 2. Clone this repo
-3. Install line-edit extension dependencies: `cd extensions/line-edit && npm install`
+3. Install line-edit extension dependencies *inside line-edit folder*: `cd extensions/line-edit && npm install`
 4. Copy extension folders to your PI extensions directory
 5. Enable in settings
 
 ## Contributing
 
 PRs are welcome, but I just do features — code is probably reviewed by AI anyway.
+
+## Credits
+
+- [oh-my-pi](https://github.com/nicholasgasior/oh-my-pi) — Reference implementation for hashline editing and diff generation in line-edit extension
+- [diff](https://www.npmjs.com/package/diff) — Myers diff algorithm (BSD-3-Clause)
 
 ## License
 
