@@ -2,9 +2,9 @@
 
 为 [PI Coding Agent](https://github.com/badlogic/pi-mono) 设计的三模式权限控制系统，控制 AI 可以执行的操作。
 
-### 更新： 添加line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
+#### 更新： 添加line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
 
-示例：
+- 示例：
 > 喵喵喵喵is a cat <br>
 > 汪汪汪汪is a dog
 
