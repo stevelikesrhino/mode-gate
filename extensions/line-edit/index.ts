@@ -100,11 +100,9 @@ const editSchema = Type.Object({
 						"append_at/prepend_at: insert after/before pos. append_file/prepend_file: add to end/start of file.",
 				},
 			),
-			pos: Type.Optional(
-				Type.String({
-					description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Required for all ops except append_file/prepend_file.',
-				}),
-			),
+			pos: Type.String({
+				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Ignored for append_file/prepend_file.',
+			}),
 			end: Type.Optional(
 				Type.String({
 					description: 'End anchor "LINE#HASH" for replace_range (inclusive).',
@@ -252,7 +250,7 @@ export default function (pi: ExtensionAPI) {
 			_toolCallId,
 			params: {
 				path: string;
-				edits: Array<{ op: string; pos?: string; end?: string; content: string }>;
+				edits: Array<{ op: string; pos: string; end?: string; content: string }>;
 			},
 			signal?: AbortSignal,
 		) {

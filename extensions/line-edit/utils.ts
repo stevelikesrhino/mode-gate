@@ -160,26 +160,22 @@ export type HashlineEdit =
 
 // --- Parse raw edits ---
 
-export function parseRawEdits(rawEdits: Array<{ op: string; pos?: string; end?: string; content: string }>): HashlineEdit[] {
+export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: string; content: string }>): HashlineEdit[] {
 	return rawEdits.map((raw) => {
 		const lines = raw.content === "" ? [] : raw.content.split("\n");
 
 		switch (raw.op) {
 			case "replace_line": {
-				if (!raw.pos) throw new Error('replace_line requires pos — a LINE#HASH anchor from read output (e.g. pos: "5#PM")');
 				return { op: "replace_line", pos: parseTag(raw.pos), lines };
 			}
 			case "replace_range": {
-				if (!raw.pos) throw new Error('replace_range requires pos — a LINE#HASH anchor for the start line (e.g. pos: "5#PM")');
 				if (!raw.end) throw new Error('replace_range requires end — a LINE#HASH anchor for the end line (e.g. end: "10#SJ")');
 				return { op: "replace_range", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
 			}
 			case "append_at": {
-				if (!raw.pos) throw new Error('append_at requires pos — a LINE#HASH anchor to insert after (e.g. pos: "5#PM")');
 				return { op: "append_at", pos: parseTag(raw.pos), lines };
 			}
 			case "prepend_at": {
-				if (!raw.pos) throw new Error('prepend_at requires pos — a LINE#HASH anchor to insert before (e.g. pos: "5#PM")');
 				return { op: "prepend_at", pos: parseTag(raw.pos), lines };
 			}
 			case "append_file":
@@ -447,11 +443,8 @@ export function generateSimpleDiff(
 					linesToShow = linesToShow.slice(0, contextLines);
 				}
 
-				if (skipStart > 0) {
-					output.push(formatDiffLine(" ", oldLineNum, lineNumWidth, "..."));
-					oldLineNum += skipStart;
-					newLineNum += skipStart;
-				}
+				oldLineNum += skipStart;
+				newLineNum += skipStart;
 
 				for (const line of linesToShow) {
 					output.push(formatDiffLine(" ", oldLineNum, lineNumWidth, line));
@@ -459,11 +452,8 @@ export function generateSimpleDiff(
 					newLineNum++;
 				}
 
-				if (skipEnd > 0) {
-					output.push(formatDiffLine(" ", oldLineNum, lineNumWidth, "..."));
-					oldLineNum += skipEnd;
-					newLineNum += skipEnd;
-				}
+				oldLineNum += skipEnd;
+				newLineNum += skipEnd;
 			} else {
 				oldLineNum += raw.length;
 				newLineNum += raw.length;
