@@ -5,10 +5,10 @@
 ### 更新： 添加line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
 
 示例：
-> 喵喵喵喵is a cat
+> 喵喵喵喵is a cat <br>
 > 汪汪汪汪is a dog
 
-编辑非常容易出错
+在千问3.5 27B + llama cpp的环境下，自带编辑器百分百出错
 
 ## 模式
 
@@ -103,10 +103,10 @@ A three-mode permission control system for [PI Coding Agent](https://github.com/
 ### Update: Added line-edit — a line-number + hash based editing tool to work around Qwen3.5 + llama.cpp tokenizer issues that prevent correct matching of CJK+English old/new strings, making certain documents uneditable. Opus wrote most of the code. Opt out if you're not using CJK characters.
 
 Example:
-> 喵喵喵喵is a cat
+> 喵喵喵喵is a cat <br>
 > 汪汪汪汪is a dog
 
-Editing is very error-prone
+With Qwen3.5 27B and llama.cpp, the default edit tool will consistently fail.
 
 ## Modes
 
