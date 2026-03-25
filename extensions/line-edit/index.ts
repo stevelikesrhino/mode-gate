@@ -93,11 +93,11 @@ const editSchema = Type.Object({
 	edits: Type.Array(
 		Type.Object({
 			op: StringEnum(
-				["replace", "insert_after", "insert_before"],
+				["replace", "replace_range", "insert_after", "insert_before"],
 				{
 					description:
-						"replace: Replace the line at pos with new content. If end is also given, replaces all lines from pos to end (inclusive). " +
-						"Use empty content to delete lines. " +
+						"replace: Replace a single line at pos with new content. Use empty content to delete the line. " +
+						"replace_range: Replace all lines from pos to end (inclusive). Requires both pos and end. Use empty content to delete the range. " +
 						"insert_after: Insert new lines immediately after the line at pos. " +
 						"insert_before: Insert new lines immediately before the line at pos.",
 				},
@@ -107,7 +107,7 @@ const editSchema = Type.Object({
 			}),
 			end: Type.Optional(
 				Type.String({
-					description: 'End anchor "LINE#HASH" for multi-line replace (inclusive). Only used with op "replace".',
+					description: 'End anchor "LINE#HASH" for replace_range (inclusive). Required when op is "replace_range".',
 				}),
 			),
 			content: Type.String({
@@ -134,9 +134,16 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: readSchema,
 
-		async execute(_toolCallId, params: { path: string; offset?: number; limit?: number }, signal?: AbortSignal) {
-			const { path, offset, limit } = params;
-			const absolutePath = resolve(process.cwd(), path);
+			async execute(_toolCallId, params: { path: string; offset?: number; limit?: number }, signal?: AbortSignal) {
+				const { path, offset, limit } = params;
+				const absolutePath = resolve(process.cwd(), path);
+
+				if (offset !== undefined && (!Number.isInteger(offset) || offset < 1)) {
+					throw new Error(`offset must be an integer >= 1, got ${offset}`);
+				}
+				if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+					throw new Error(`limit must be an integer >= 1, got ${limit}`);
+				}
 
 			if (signal?.aborted) throw new Error("Operation aborted");
 
@@ -148,10 +155,11 @@ export default function (pi: ExtensionAPI) {
 
 			const raw = await readFile(absolutePath, "utf-8");
 			const content = raw.startsWith("\uFEFF") ? raw.slice(1) : raw;
-			const allLines = content.split("\n");
+			const normalized = content.replace(/\r\n/g, "\n");
+			const allLines = normalized.split("\n");
 			const totalLines = allLines.length;
 
-			const startLine = offset ? Math.max(0, offset - 1) : 0;
+				const startLine = offset !== undefined ? offset - 1 : 0;
 			if (startLine >= allLines.length) {
 				throw new Error(`Offset ${offset} is beyond end of file (${totalLines} lines)`);
 			}
@@ -236,11 +244,12 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Edit a file using LINE#HASH anchors from read output. Supports multiple operations per call. " +
 			"Hashes are validated before any changes — stale references are rejected with updated anchors.",
-		promptSnippet: "Edit file using LINE#HASH anchors (replace, insert, append, prepend)",
+		promptSnippet: "Edit file using LINE#HASH anchors (replace, replace_range, insert_after, insert_before)",
 		promptGuidelines: [
 			"Always read a file before editing it to get current LINE#HASH anchors.",
 			"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
-			"Operations: replace (one line, or pos..end range), insert_after (add lines after pos), insert_before (add lines before pos).",
+			"Operations: replace (single line), replace_range (pos to end inclusive), insert_after, insert_before.",
+			"Use replace_range with pos and end to delete or replace multiple lines (e.g. op: \"replace_range\", pos: \"5#PM\", end: \"9#NQ\", content: \"\").",
 			"content is the replacement/insertion text. Use \\n for multiple lines. Empty string deletes lines.",
 			"Multiple edits per call are safe — they are applied bottom-up so line numbers stay valid.",
 			"If hashes don't match (file changed), you'll get updated anchors — retry with those.",

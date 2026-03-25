@@ -113,7 +113,9 @@ function isSegmentSafe(segment: string): boolean {
 }
 
 export function isSafeCommand(command: string): boolean {
-	const segments = command.split(/\s*(?:\||\|\||&&|;)\s*/);
+	// Strip quoted strings so operators inside quotes aren't treated as separators
+	const stripped = command.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '""');
+	const segments = stripped.split(/\s*(?:\|\||&&|[|;])\s*/);
 	return segments.every((seg) => isSegmentSafe(seg));
 }
 

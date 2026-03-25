@@ -32,7 +32,7 @@ const RE_SIGNIFICANT = /[\p{L}\p{N}]/u;
  * collisions among structurally identical lines like `{`, `}`, ``.
  */
 export function computeLineHash(idx: number, line: string): string {
-	line = line.replace(/\r/g, "").trimEnd();
+	line = line.replace(/\r/g, "");
 	let seed = 0;
 	if (!RE_SIGNIFICANT.test(line)) {
 		seed = idx;
@@ -151,7 +151,8 @@ export function validateRef(ref: Anchor, fileLines: string[], mismatches: HashMi
 // --- Edit types ---
 
 export type HashlineEdit =
-	| { op: "replace"; pos: Anchor; end?: Anchor; lines: string[] }
+	| { op: "replace"; pos: Anchor; lines: string[] }
+	| { op: "replace_range"; pos: Anchor; end: Anchor; lines: string[] }
 	| { op: "insert_after"; pos: Anchor; lines: string[] }
 	| { op: "insert_before"; pos: Anchor; lines: string[] };
 
@@ -163,9 +164,13 @@ export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: s
 
 		switch (raw.op) {
 			case "replace": {
-				const pos = parseTag(raw.pos);
-				const end = raw.end ? parseTag(raw.end) : undefined;
-				return { op: "replace", pos, end, lines };
+				return { op: "replace", pos: parseTag(raw.pos), lines };
+			}
+			case "replace_range": {
+				if (!raw.end) {
+					throw new Error(`replace_range requires an "end" anchor.`);
+				}
+				return { op: "replace_range", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
 			}
 			case "insert_after": {
 				return { op: "insert_after", pos: parseTag(raw.pos), lines };
@@ -174,7 +179,7 @@ export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: s
 				return { op: "insert_before", pos: parseTag(raw.pos), lines };
 			}
 			default:
-				throw new Error(`Unknown op "${raw.op}". Valid: replace, insert_after, insert_before`);
+				throw new Error(`Unknown op "${raw.op}". Valid: replace, replace_range, insert_after, insert_before`);
 		}
 	});
 }
@@ -200,11 +205,13 @@ export function applyHashlineEdits(
 		switch (edit.op) {
 			case "replace": {
 				validateRef(edit.pos, fileLines, mismatches);
-				if (edit.end) {
-					validateRef(edit.end, fileLines, mismatches);
-					if (edit.pos.line > edit.end.line) {
-						throw new Error(`Range start ${edit.pos.line} must be <= end ${edit.end.line}`);
-					}
+				break;
+			}
+			case "replace_range": {
+				validateRef(edit.pos, fileLines, mismatches);
+				validateRef(edit.end, fileLines, mismatches);
+				if (edit.pos.line > edit.end.line) {
+					throw new Error(`Range start ${edit.pos.line} must be <= end ${edit.end.line}`);
 				}
 				break;
 			}
@@ -221,8 +228,8 @@ export function applyHashlineEdits(
 
 	// Boundary duplication warning
 	for (const edit of edits) {
-		if (edit.op !== "replace") continue;
-		const endLine = edit.end ? edit.end.line : edit.pos.line;
+		if (edit.op !== "replace" && edit.op !== "replace_range") continue;
+		const endLine = edit.op === "replace_range" ? edit.end.line : edit.pos.line;
 		if (edit.lines.length === 0) continue;
 		const nextIdx = endLine; // 0-indexed next surviving line
 		if (nextIdx >= originalFileLines.length) continue;
@@ -245,7 +252,10 @@ export function applyHashlineEdits(
 		let key: string;
 		switch (edit.op) {
 			case "replace":
-				key = `r:${edit.pos.line}:${edit.end?.line ?? ""}:${edit.lines.join("\n")}`;
+				key = `r:${edit.pos.line}::${edit.lines.join("\n")}`;
+				break;
+			case "replace_range":
+				key = `rr:${edit.pos.line}:${edit.end.line}:${edit.lines.join("\n")}`;
 				break;
 			case "insert_after":
 				key = `ia:${edit.pos.line}:${edit.lines.join("\n")}`;
@@ -266,7 +276,11 @@ export function applyHashlineEdits(
 		let precedence: number;
 		switch (edit.op) {
 			case "replace":
-				sortLine = edit.end ? edit.end.line : edit.pos.line;
+				sortLine = edit.pos.line;
+				precedence = 0;
+				break;
+			case "replace_range":
+				sortLine = edit.end.line;
 				precedence = 0;
 				break;
 			case "insert_after":
@@ -286,14 +300,15 @@ export function applyHashlineEdits(
 	for (const { edit } of sorted) {
 		switch (edit.op) {
 			case "replace": {
-				if (edit.end) {
-					const count = edit.end.line - edit.pos.line + 1;
-					fileLines.splice(edit.pos.line - 1, count, ...edit.lines);
-				} else {
-					const orig = fileLines[edit.pos.line - 1];
-					if (edit.lines.length === 1 && edit.lines[0] === orig) break; // noop
-					fileLines.splice(edit.pos.line - 1, 1, ...edit.lines);
-				}
+				const orig = fileLines[edit.pos.line - 1];
+				if (edit.lines.length === 1 && edit.lines[0] === orig) break; // noop
+				fileLines.splice(edit.pos.line - 1, 1, ...edit.lines);
+				track(edit.pos.line);
+				break;
+			}
+			case "replace_range": {
+				const count = edit.end.line - edit.pos.line + 1;
+				fileLines.splice(edit.pos.line - 1, count, ...edit.lines);
 				track(edit.pos.line);
 				break;
 			}
@@ -330,7 +345,7 @@ function countContentLines(content: string): number {
 }
 
 function formatDiffLine(prefix: "+" | "-" | " ", lineNum: number, width: number, content: string): string {
-	return `${prefix}${String(lineNum).padStart(width)}|${content}`;
+	return `${prefix}${String(lineNum).padStart(width)} ${content}`;
 }
 
 export function generateSimpleDiff(
