@@ -151,12 +151,9 @@ export function validateRef(ref: Anchor, fileLines: string[], mismatches: HashMi
 // --- Edit types ---
 
 export type HashlineEdit =
-	| { op: "replace_line"; pos: Anchor; lines: string[] }
-	| { op: "replace_range"; pos: Anchor; end: Anchor; lines: string[] }
-	| { op: "append_at"; pos: Anchor; lines: string[] }
-	| { op: "prepend_at"; pos: Anchor; lines: string[] }
-	| { op: "append_file"; lines: string[] }
-	| { op: "prepend_file"; lines: string[] };
+	| { op: "replace"; pos: Anchor; end?: Anchor; lines: string[] }
+	| { op: "insert_after"; pos: Anchor; lines: string[] }
+	| { op: "insert_before"; pos: Anchor; lines: string[] };
 
 // --- Parse raw edits ---
 
@@ -165,25 +162,19 @@ export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: s
 		const lines = raw.content === "" ? [] : raw.content.split("\n");
 
 		switch (raw.op) {
-			case "replace_line": {
-				return { op: "replace_line", pos: parseTag(raw.pos), lines };
+			case "replace": {
+				const pos = parseTag(raw.pos);
+				const end = raw.end ? parseTag(raw.end) : undefined;
+				return { op: "replace", pos, end, lines };
 			}
-			case "replace_range": {
-				if (!raw.end) throw new Error('replace_range requires end — a LINE#HASH anchor for the end line (e.g. end: "10#SJ")');
-				return { op: "replace_range", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
+			case "insert_after": {
+				return { op: "insert_after", pos: parseTag(raw.pos), lines };
 			}
-			case "append_at": {
-				return { op: "append_at", pos: parseTag(raw.pos), lines };
+			case "insert_before": {
+				return { op: "insert_before", pos: parseTag(raw.pos), lines };
 			}
-			case "prepend_at": {
-				return { op: "prepend_at", pos: parseTag(raw.pos), lines };
-			}
-			case "append_file":
-				return { op: "append_file", lines };
-			case "prepend_file":
-				return { op: "prepend_file", lines };
 			default:
-				throw new Error(`Unknown op "${raw.op}". Valid: replace_line, replace_range, append_at, prepend_at, append_file, prepend_file`);
+				throw new Error(`Unknown op "${raw.op}". Valid: replace, insert_after, insert_before`);
 		}
 	});
 }
@@ -207,24 +198,19 @@ export function applyHashlineEdits(
 	const mismatches: HashMismatch[] = [];
 	for (const edit of edits) {
 		switch (edit.op) {
-			case "replace_line":
+			case "replace": {
 				validateRef(edit.pos, fileLines, mismatches);
-				break;
-			case "replace_range": {
-				validateRef(edit.pos, fileLines, mismatches);
-				validateRef(edit.end, fileLines, mismatches);
-				if (edit.pos.line > edit.end.line) {
-					throw new Error(`Range start ${edit.pos.line} must be <= end ${edit.end.line}`);
+				if (edit.end) {
+					validateRef(edit.end, fileLines, mismatches);
+					if (edit.pos.line > edit.end.line) {
+						throw new Error(`Range start ${edit.pos.line} must be <= end ${edit.end.line}`);
+					}
 				}
 				break;
 			}
-			case "append_at":
-			case "prepend_at":
+			case "insert_after":
+			case "insert_before":
 				validateRef(edit.pos, fileLines, mismatches);
-				if (edit.lines.length === 0) edit.lines = [""];
-				break;
-			case "append_file":
-			case "prepend_file":
 				if (edit.lines.length === 0) edit.lines = [""];
 				break;
 		}
@@ -235,10 +221,8 @@ export function applyHashlineEdits(
 
 	// Boundary duplication warning
 	for (const edit of edits) {
-		let endLine: number;
-		if (edit.op === "replace_line") endLine = edit.pos.line;
-		else if (edit.op === "replace_range") endLine = edit.end.line;
-		else continue;
+		if (edit.op !== "replace") continue;
+		const endLine = edit.end ? edit.end.line : edit.pos.line;
 		if (edit.lines.length === 0) continue;
 		const nextIdx = endLine; // 0-indexed next surviving line
 		if (nextIdx >= originalFileLines.length) continue;
@@ -260,23 +244,14 @@ export function applyHashlineEdits(
 		const edit = edits[i];
 		let key: string;
 		switch (edit.op) {
-			case "replace_line":
-				key = `rl:${edit.pos.line}:${edit.lines.join("\n")}`;
+			case "replace":
+				key = `r:${edit.pos.line}:${edit.end?.line ?? ""}:${edit.lines.join("\n")}`;
 				break;
-			case "replace_range":
-				key = `rr:${edit.pos.line}:${edit.end.line}:${edit.lines.join("\n")}`;
+			case "insert_after":
+				key = `ia:${edit.pos.line}:${edit.lines.join("\n")}`;
 				break;
-			case "append_at":
-				key = `aa:${edit.pos.line}:${edit.lines.join("\n")}`;
-				break;
-			case "prepend_at":
-				key = `pa:${edit.pos.line}:${edit.lines.join("\n")}`;
-				break;
-			case "append_file":
-				key = `af:${edit.lines.join("\n")}`;
-				break;
-			case "prepend_file":
-				key = `pf:${edit.lines.join("\n")}`;
+			case "insert_before":
+				key = `ib:${edit.pos.line}:${edit.lines.join("\n")}`;
 				break;
 		}
 		if (!seen.has(key)) {
@@ -290,28 +265,16 @@ export function applyHashlineEdits(
 		let sortLine: number;
 		let precedence: number;
 		switch (edit.op) {
-			case "replace_line":
-				sortLine = edit.pos.line;
+			case "replace":
+				sortLine = edit.end ? edit.end.line : edit.pos.line;
 				precedence = 0;
 				break;
-			case "replace_range":
-				sortLine = edit.end.line;
-				precedence = 0;
-				break;
-			case "append_at":
+			case "insert_after":
 				sortLine = edit.pos.line;
 				precedence = 1;
 				break;
-			case "prepend_at":
+			case "insert_before":
 				sortLine = edit.pos.line;
-				precedence = 2;
-				break;
-			case "append_file":
-				sortLine = fileLines.length + 1;
-				precedence = 1;
-				break;
-			case "prepend_file":
-				sortLine = 0;
 				precedence = 2;
 				break;
 		}
@@ -322,42 +285,25 @@ export function applyHashlineEdits(
 	// Apply bottom-up
 	for (const { edit } of sorted) {
 		switch (edit.op) {
-			case "replace_line": {
-				const orig = fileLines[edit.pos.line - 1];
-				if (edit.lines.length === 1 && edit.lines[0] === orig) break; // noop
-				fileLines.splice(edit.pos.line - 1, 1, ...edit.lines);
+			case "replace": {
+				if (edit.end) {
+					const count = edit.end.line - edit.pos.line + 1;
+					fileLines.splice(edit.pos.line - 1, count, ...edit.lines);
+				} else {
+					const orig = fileLines[edit.pos.line - 1];
+					if (edit.lines.length === 1 && edit.lines[0] === orig) break; // noop
+					fileLines.splice(edit.pos.line - 1, 1, ...edit.lines);
+				}
 				track(edit.pos.line);
 				break;
 			}
-			case "replace_range": {
-				const count = edit.end.line - edit.pos.line + 1;
-				fileLines.splice(edit.pos.line - 1, count, ...edit.lines);
-				track(edit.pos.line);
-				break;
-			}
-			case "append_at":
+			case "insert_after":
 				fileLines.splice(edit.pos.line, 0, ...edit.lines);
 				track(edit.pos.line + 1);
 				break;
-			case "prepend_at":
+			case "insert_before":
 				fileLines.splice(edit.pos.line - 1, 0, ...edit.lines);
 				track(edit.pos.line);
-				break;
-			case "append_file":
-				if (fileLines.length === 1 && fileLines[0] === "") {
-					fileLines.splice(0, 1, ...edit.lines);
-				} else {
-					fileLines.push(...edit.lines);
-				}
-				track(fileLines.length - edit.lines.length + 1);
-				break;
-			case "prepend_file":
-				if (fileLines.length === 1 && fileLines[0] === "") {
-					fileLines.splice(0, 1, ...edit.lines);
-				} else {
-					fileLines.unshift(...edit.lines);
-				}
-				track(1);
 				break;
 		}
 	}

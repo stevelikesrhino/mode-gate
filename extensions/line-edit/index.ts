@@ -93,19 +93,21 @@ const editSchema = Type.Object({
 	edits: Type.Array(
 		Type.Object({
 			op: StringEnum(
-				["replace_line", "replace_range", "append_at", "prepend_at", "append_file", "prepend_file"],
+				["replace", "insert_after", "insert_before"],
 				{
 					description:
-						"replace_line: replace one line. replace_range: replace pos..end inclusive. " +
-						"append_at/prepend_at: insert after/before pos. append_file/prepend_file: add to end/start of file.",
+						"replace: Replace the line at pos with new content. If end is also given, replaces all lines from pos to end (inclusive). " +
+						"Use empty content to delete lines. " +
+						"insert_after: Insert new lines immediately after the line at pos. " +
+						"insert_before: Insert new lines immediately before the line at pos.",
 				},
 			),
 			pos: Type.String({
-				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Ignored for append_file/prepend_file.',
+				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Identifies which line to act on.',
 			}),
 			end: Type.Optional(
 				Type.String({
-					description: 'End anchor "LINE#HASH" for replace_range (inclusive).',
+					description: 'End anchor "LINE#HASH" for multi-line replace (inclusive). Only used with op "replace".',
 				}),
 			),
 			content: Type.String({
@@ -238,7 +240,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Always read a file before editing it to get current LINE#HASH anchors.",
 			"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
-			"Operations: replace_line (one line), replace_range (pos..end inclusive), append_at (insert after), prepend_at (insert before), append_file, prepend_file.",
+			"Operations: replace (one line, or pos..end range), insert_after (add lines after pos), insert_before (add lines before pos).",
 			"content is the replacement/insertion text. Use \\n for multiple lines. Empty string deletes lines.",
 			"Multiple edits per call are safe — they are applied bottom-up so line numbers stay valid.",
 			"If hashes don't match (file changed), you'll get updated anchors — retry with those.",
