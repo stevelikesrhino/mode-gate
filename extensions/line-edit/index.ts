@@ -247,11 +247,12 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Edit file using LINE#HASH anchors (replace, replace_range, insert_after, insert_before)",
 		promptGuidelines: [
 			"Always read a file before editing it to get current LINE#HASH anchors.",
+			"Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.",
 			"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
 			"Operations: replace (single line), replace_range (pos to end inclusive), insert_after, insert_before.",
 			"Use replace_range with pos and end to delete or replace multiple lines (e.g. op: \"replace_range\", pos: \"5#PM\", end: \"9#NQ\", content: \"\").",
 			"content is the replacement/insertion text. Use \\n for multiple lines. Empty string deletes lines.",
-			"Multiple edits per call are safe — they are applied bottom-up so line numbers stay valid.",
+			"Multiple edits per call are safe, but avoid too many disjoint edits in one call.",
 			"If hashes don't match (file changed), you'll get updated anchors — retry with those.",
 			"You do NOT need to reproduce original text. Just reference the LINE#HASH anchor.",
 		],
