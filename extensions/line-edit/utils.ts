@@ -160,8 +160,13 @@ function parseEditContent(content: string): string[] {
 	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	const rawLines = normalized.split("\n");
 	const nonBlankLines = rawLines.filter((line) => line.trim().length > 0);
-	const allHashPrefixed = nonBlankLines.length > 0 && nonBlankLines.every((line) => HASHLINE_PREFIX_RE.test(line));
-	if (!allHashPrefixed) return rawLines;
+	const prefixedLineCount = nonBlankLines.filter((line) => HASHLINE_PREFIX_RE.test(line)).length;
+	if (prefixedLineCount > 0 && prefixedLineCount !== nonBlankLines.length) {
+		throw new Error(
+			'Mixed edit content is not allowed: either provide plain file text only, or prefix every copied existing line with LINE#HASH:.',
+		);
+	}
+	if (prefixedLineCount === 0) return rawLines;
 
 	return rawLines.map((line) => {
 		const match = line.match(HASHLINE_PREFIX_RE);
@@ -169,9 +174,30 @@ function parseEditContent(content: string): string[] {
 	});
 }
 
-export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: string; content: string }>): HashlineEdit[] {
+function stripTrailingWhitespace(text: string): string {
+	const parts = text.split(/(\r\n|\n|\r)/);
+	let result = "";
+
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		if (part === undefined) continue;
+		result += i % 2 === 0 ? part.replace(/\s+$/g, "") : part;
+	}
+
+	return result;
+}
+
+function normalizeEditContent(content: string, filePath: string): string {
+	const isMarkdown = /\.(md|mdx)$/i.test(filePath);
+	return isMarkdown ? content : stripTrailingWhitespace(content);
+}
+
+export function parseRawEdits(
+	rawEdits: Array<{ op: string; pos: string; end?: string; content: string }>,
+	filePath: string,
+): HashlineEdit[] {
 	return rawEdits.map((raw) => {
-		const lines = parseEditContent(raw.content);
+		const lines = parseEditContent(normalizeEditContent(raw.content, filePath));
 
 		switch (raw.op) {
 			case "replace": {
@@ -237,6 +263,8 @@ export function applyHashlineEdits(
 		throw new HashlineMismatchError(mismatches, fileLines);
 	}
 
+	validateEditConflicts(edits);
+
 	// Boundary duplication warning
 	for (const edit of edits) {
 		if (edit.op !== "replace" && edit.op !== "replace_range") continue;
@@ -269,10 +297,8 @@ export function applyHashlineEdits(
 				key = `rr:${edit.pos.line}:${edit.end.line}:${edit.lines.join("\n")}`;
 				break;
 			case "insert_after":
-				key = `ia:${edit.pos.line}:${edit.lines.join("\n")}`;
-				break;
 			case "insert_before":
-				key = `ib:${edit.pos.line}:${edit.lines.join("\n")}`;
+				key = `i:${getInsertBoundary(edit)}:${edit.lines.join("\n")}`;
 				break;
 		}
 		if (!seen.has(key)) {
@@ -338,6 +364,74 @@ export function applyHashlineEdits(
 
 	function track(line: number) {
 		if (firstChangedLine === undefined || line < firstChangedLine) firstChangedLine = line;
+	}
+}
+
+function getInsertBoundary(edit: Extract<HashlineEdit, { op: "insert_after" | "insert_before" }>): number {
+	return edit.op === "insert_before" ? edit.pos.line - 1 : edit.pos.line;
+}
+
+function describeEdit(edit: HashlineEdit): string {
+	switch (edit.op) {
+		case "replace":
+			return `replace at line ${edit.pos.line}`;
+		case "replace_range":
+			return `replace_range ${edit.pos.line}-${edit.end.line}`;
+		case "insert_after":
+			return `insert_after line ${edit.pos.line}`;
+		case "insert_before":
+			return `insert_before line ${edit.pos.line}`;
+	}
+}
+
+function validateEditConflicts(edits: HashlineEdit[]): void {
+	const replacements = edits
+		.filter((edit): edit is Extract<HashlineEdit, { op: "replace" | "replace_range" }> => edit.op === "replace" || edit.op === "replace_range")
+		.map((edit) => ({
+			edit,
+			start: edit.pos.line,
+			end: edit.op === "replace_range" ? edit.end.line : edit.pos.line,
+		}))
+		.sort((a, b) => a.start - b.start || a.end - b.end);
+
+	for (let i = 1; i < replacements.length; i++) {
+		const prev = replacements[i - 1];
+		const current = replacements[i];
+		if (prev.end >= current.start) {
+			throw new Error(
+				`Conflicting edits: ${describeEdit(prev.edit)} overlaps with ${describeEdit(current.edit)}. ` +
+					`Merge them into one replacement block.`,
+			);
+		}
+	}
+
+	const insertions = new Map<number, { edit: Extract<HashlineEdit, { op: "insert_after" | "insert_before" }>; content: string }>();
+	for (const edit of edits) {
+		if (edit.op !== "insert_after" && edit.op !== "insert_before") continue;
+
+		const boundary = getInsertBoundary(edit);
+		const content = edit.lines.join("\n");
+		const existing = insertions.get(boundary);
+		if (existing && existing.content !== content) {
+			throw new Error(
+				`Conflicting edits: ${describeEdit(existing.edit)} and ${describeEdit(edit)} target the same insertion point. ` +
+					`Merge them into one insertion.`,
+			);
+		}
+		if (!existing) {
+			insertions.set(boundary, { edit, content });
+		}
+	}
+
+	for (const { edit, start, end } of replacements) {
+		for (const [boundary, insertion] of insertions) {
+			if (boundary >= start - 1 && boundary <= end) {
+				throw new Error(
+					`Conflicting edits: ${describeEdit(insertion.edit)} touches the same block as ${describeEdit(edit)}. ` +
+						`Merge them into one replacement block.`,
+				);
+			}
+		}
 	}
 }
 

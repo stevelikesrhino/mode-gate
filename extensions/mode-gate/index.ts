@@ -37,6 +37,10 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	const EXPLORE_BLOCKED = "BLOCKED: you are in explore mode — only read-only tools and safe commands are permitted. Do NOT retry. Do NOT use bash to write/edit files. Describe what you would change instead, concisely.";
+	const EXPLORE_REMINDER =
+		'<system-reminder>You are in explore mode, you cannot write or edit or make file changes.</system-reminder>';
+	const WATCHED_REMINDER =
+		"<system-reminder>You are in watched mode. Read-only tools are fine, but edits, writes, and destructive bash commands require user approval. Plan accordingly and do not assume approval.</system-reminder>";
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (currentMode === "watched") {
@@ -94,12 +98,19 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	});
 
 	// Reset "allow_all" every turn
-	pi.on("before_agent_start", async (event, ctx) => {
+	pi.on("before_agent_start", async (event, _ctx) => {
 		resetAllowAll();
-		if (currentMode !== "explore") return;
-		return {                                                                                 
-          systemPrompt: event.systemPrompt + "\n\n<system-reminder>You are in **explore mode**, you cannot write or edit or make file changes.</system-reminder>",
-      	}; 
+		if (currentMode === "explore") {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${EXPLORE_REMINDER}`,
+			};
+		}
+		if (currentMode === "watched") {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${WATCHED_REMINDER}`,
+			};
+		}
+		return;
 	});
 
 	// Shared confirmation dialog with optional Tab-to-add-message
