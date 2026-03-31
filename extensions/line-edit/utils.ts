@@ -24,20 +24,14 @@ const DICT = Array.from({ length: 256 }, (_, i) => {
 	return `${NIBBLE_STR[h]}${NIBBLE_STR[l]}`;
 });
 
-const RE_SIGNIFICANT = /[\p{L}\p{N}]/u;
-
 /**
- * Compute 2-char hash for a line. For lines with no alphanumeric content
- * (blank, punctuation-only), the line number is mixed in as seed to reduce
- * collisions among structurally identical lines like `{`, `}`, ``.
+ * Compute 2-char hash for a line anchored to its 1-indexed line number.
+ * This makes the full LINE#HASH token the identity, so the same content on
+ * a different line no longer validates as a stale reference.
  */
 export function computeLineHash(idx: number, line: string): string {
 	line = line.replace(/\r/g, "");
-	let seed = 0;
-	if (!RE_SIGNIFICANT.test(line)) {
-		seed = idx;
-	}
-	return DICT[hash32(line, seed) & 0xff];
+	return DICT[hash32(line, idx) & 0xff];
 }
 
 export function formatLineTag(lineNum: number, lineText: string): string {
