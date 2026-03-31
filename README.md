@@ -92,7 +92,7 @@
 
 ## 许可证
 
-GPLv3
+MIT
 
 ---
 
@@ -190,4 +190,4 @@ PRs are welcome, but I just do features — code is probably reviewed by AI anyw
 
 ## License
 
-GPLv3
+MIT
