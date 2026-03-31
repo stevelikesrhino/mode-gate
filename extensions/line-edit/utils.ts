@@ -158,9 +158,26 @@ export type HashlineEdit =
 
 // --- Parse raw edits ---
 
+const HASHLINE_PREFIX_RE = /^\s*(?:>>>\s*)?\d+\s*#\s*[ZPMQVRWSNKTXJBYH]{2}:(.*)$/;
+
+function parseEditContent(content: string): string[] {
+	if (content === "") return [];
+
+	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	const rawLines = normalized.split("\n");
+	const nonBlankLines = rawLines.filter((line) => line.trim().length > 0);
+	const allHashPrefixed = nonBlankLines.length > 0 && nonBlankLines.every((line) => HASHLINE_PREFIX_RE.test(line));
+	if (!allHashPrefixed) return rawLines;
+
+	return rawLines.map((line) => {
+		const match = line.match(HASHLINE_PREFIX_RE);
+		return match ? match[1] : line;
+	});
+}
+
 export function parseRawEdits(rawEdits: Array<{ op: string; pos: string; end?: string; content: string }>): HashlineEdit[] {
 	return rawEdits.map((raw) => {
-		const lines = raw.content === "" ? [] : raw.content.split("\n");
+		const lines = parseEditContent(raw.content);
 
 		switch (raw.op) {
 			case "replace": {
