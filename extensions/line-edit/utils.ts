@@ -38,19 +38,6 @@ export function formatLineTag(lineNum: number, lineText: string): string {
 	return `${lineNum}#${computeLineHash(lineNum, lineText)}`;
 }
 
-/**
- * Format file text with hashline prefixes: `LINE#HASH:TEXT`
- */
-export function formatHashLines(text: string, startLine = 1): string {
-	const lines = text.split("\n");
-	return lines
-		.map((line, i) => {
-			const num = startLine + i;
-			return `${formatLineTag(num, line)}:${line}`;
-		})
-		.join("\n");
-}
-
 // --- Tag parsing ---
 
 export interface Anchor {
@@ -152,26 +139,11 @@ export type HashlineEdit =
 
 // --- Parse raw edits ---
 
-const HASHLINE_PREFIX_RE = /^\s*(?:>>>\s*)?\d+\s*#\s*[ZPMQVRWSNKTXJBYH]{2}:(.*)$/;
-
 function parseEditContent(content: string): string[] {
 	if (content === "") return [];
 
 	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	const rawLines = normalized.split("\n");
-	const nonBlankLines = rawLines.filter((line) => line.trim().length > 0);
-	const prefixedLineCount = nonBlankLines.filter((line) => HASHLINE_PREFIX_RE.test(line)).length;
-	if (prefixedLineCount > 0 && prefixedLineCount !== nonBlankLines.length) {
-		throw new Error(
-			'Mixed edit content is not allowed: either provide plain file text only, or prefix every copied existing line with LINE#HASH:.',
-		);
-	}
-	if (prefixedLineCount === 0) return rawLines;
-
-	return rawLines.map((line) => {
-		const match = line.match(HASHLINE_PREFIX_RE);
-		return match ? match[1] : line;
-	});
+	return normalized.split("\n");
 }
 
 function stripTrailingWhitespace(text: string): string {

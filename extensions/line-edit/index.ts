@@ -26,7 +26,6 @@ import {
 	applyHashlineEdits,
 	generateSimpleDiff,
 	truncateContent,
-	type HashlineEdit,
 } from "./utils";
 
 // ═══════════════════════════════════════════════════════════════════════════
