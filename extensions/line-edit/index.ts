@@ -116,6 +116,36 @@ const editSchema = Type.Object({
 	),
 });
 
+function normalizeEditArguments(input: unknown): unknown {
+	if (!input) return input;
+
+	let args: any = input;
+
+	// Some providers/models emit tool arguments as a JSON string.
+	if (typeof args === "string") {
+		try {
+			args = JSON.parse(args);
+		} catch {
+			return input;
+		}
+	}
+
+	if (typeof args !== "object" || Array.isArray(args)) {
+		return args;
+	}
+
+	// Gemma/llama.cpp can emit edits as a JSON-encoded string.
+	if (typeof args.edits === "string") {
+		try {
+			args = { ...args, edits: JSON.parse(args.edits) };
+		} catch {
+			// Keep original args so validator emits a clear error.
+		}
+	}
+
+	return args;
+}
+
 export default function (pi: ExtensionAPI) {
 	// ─── Override read ───────────────────────────────────────────────────
 	pi.registerTool({
@@ -268,6 +298,7 @@ export default function (pi: ExtensionAPI) {
 				"You do NOT need to reproduce original text. Just reference the LINE#HASH anchor.",
 			],
 		parameters: editSchema,
+		prepareArguments: normalizeEditArguments,
 
 		async execute(
 			_toolCallId,
