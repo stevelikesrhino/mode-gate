@@ -59,7 +59,6 @@ function latexToMarkdown(text: string): string {
   }
 
   // 5. Common Math Symbols
-  // 5. Common Math Symbols
   currentText = currentText
     .replace(/\\Rightarrow/g, "=>")
     .replace(/\\Leftarrow/g, "<=")
