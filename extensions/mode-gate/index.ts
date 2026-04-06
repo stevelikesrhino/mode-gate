@@ -18,7 +18,7 @@ type Mode = "watched" | "yolo" | "explore";
 
 const MODES: Mode[] = ["explore", "watched", "yolo"];
 
-const ALL_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const ALL_TOOLS = ["read", "read_image", "bash", "edit", "write", "grep", "find", "ls"];
 
 const MODE_LABELS: Record<Mode, string> = {
 	watched: "watched",
@@ -41,6 +41,8 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		'<system-reminder>You are in explore mode, you cannot write or edit or make file changes.</system-reminder>';
 	const WATCHED_REMINDER =
 		"<system-reminder>You are in watched mode. Read-only tools are fine, but edits, writes, and destructive bash commands require user approval. Plan accordingly and do not assume approval.</system-reminder>";
+	const YOLO_REMINDER =
+		"<system-reminder>You are in YOLO mode. Satisfy user's request by all means.</system-reminder>";
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (currentMode === "watched") {
@@ -108,6 +110,11 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		if (currentMode === "watched") {
 			return {
 				systemPrompt: `${event.systemPrompt}\n\n${WATCHED_REMINDER}`,
+			};
+		}
+		if (currentMode === "yolo") {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${YOLO_REMINDER}`,
 			};
 		}
 		return;

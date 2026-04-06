@@ -12,7 +12,14 @@
  * Overrides: `read` (hashline-formatted output) and `edit` (anchor-based operations).
  */
 
-import { type ExtensionAPI, withFileMutationQueue, renderDiff, keyHint } from "@mariozechner/pi-coding-agent";
+import {
+	type ExtensionAPI,
+	withFileMutationQueue,
+	renderDiff,
+	keyHint,
+	createReadToolDefinition,
+	defineTool,
+} from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -96,7 +103,7 @@ const editSchema = Type.Object({
 				{
 					description:
 						"replace: Replace a single line at pos with new content. Use empty content to delete the line. " +
-						"replace_range: Replace all lines from pos to end (inclusive). Requires both pos and end. Use empty content to delete the range. " +
+						"replace_range: Replace multiple lines from pos to end (inclusive). Requires both pos and end. Use empty content to delete the range. " +
 						"insert_after: Insert new lines immediately after the line at pos. " +
 						"insert_before: Insert new lines immediately before the line at pos.",
 				},
@@ -146,9 +153,34 @@ function normalizeEditArguments(input: unknown): unknown {
 	return args;
 }
 
+const getSystemReadTool = (cwd?: string) => createReadToolDefinition(cwd ?? process.cwd());
+const systemReadTool = getSystemReadTool();
+
 export default function (pi: ExtensionAPI) {
+	// ─── Add read_image (delegate to system read) ─────────────────────────
+	const readImageTool = defineTool({
+		name: "read_image",
+		label: "read_image",
+		description: systemReadTool.description,
+		promptSnippet: "Read file contents with system read (use for images)",
+		promptGuidelines: ["Use read_image for image files to preserve default image attachment behavior."],
+		parameters: systemReadTool.parameters,
+		async execute(
+			toolCallId,
+			params,
+			signal?: AbortSignal,
+			onUpdate?,
+			ctx?,
+		) {
+			const delegate = getSystemReadTool(ctx?.cwd);
+			return delegate.execute(toolCallId, params, signal, onUpdate, ctx);
+		},
+		renderCall: systemReadTool.renderCall,
+		renderResult: systemReadTool.renderResult,
+	});
+
 	// ─── Override read ───────────────────────────────────────────────────
-	pi.registerTool({
+	const readTool = defineTool({
 		name: "read",
 		label: "read",
 		description:
@@ -163,13 +195,13 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: readSchema,
 
-		async execute(
-			_toolCallId,
-			params: { path: string; offset?: number; limit?: number },
-			signal?: AbortSignal,
-			_onUpdate?,
-			ctx?,
-		) {
+			async execute(
+				_toolCallId,
+				params,
+				signal?: AbortSignal,
+				_onUpdate?,
+				ctx?,
+			) {
 			const { path, offset, limit } = params;
 			const absolutePath = resolve(ctx?.cwd ?? process.cwd(), path);
 
@@ -233,11 +265,11 @@ export default function (pi: ExtensionAPI) {
 
 			const outputText = truncationNotice ? `${truncContent}\n\n${truncationNotice}` : truncContent;
 
-			return {
-				content: [{ type: "text" as const, text: outputText }],
-				details: { lines: totalLines, truncationNotice },
-			};
-		},
+				return {
+					content: [{ type: "text", text: outputText }],
+					details: { lines: totalLines, truncationNotice },
+				};
+			},
 		renderResult(result, options, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			const rawContent = result.content[0]?.text ?? "";
@@ -273,7 +305,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ─── Override edit ───────────────────────────────────────────────────
-	pi.registerTool({
+	const editTool = defineTool({
 		name: "edit",
 		label: "edit",
 		description:
@@ -293,19 +325,14 @@ export default function (pi: ExtensionAPI) {
 				"Example replace_range: {\"op\":\"replace_range\",\"pos\":\"5#PM\",\"end\":\"9#NQ\",\"content\":\"if (ok) {\\n  return value;\\n}\"}",
 				"Example insert_after: {\"op\":\"insert_after\",\"pos\":\"12#VR\",\"content\":\"console.log(answer);\"}",
 				"Example insert_before: {\"op\":\"insert_before\",\"pos\":\"3#WS\",\"content\":\"import { foo } from \\\"./foo\\\";\"}",
-				"Multiple edits per call are safe, but avoid too many disjoint edits in one call.",
 				"If hashes don't match (file changed), you'll get updated anchors — retry with those.",
-				"You do NOT need to reproduce original text. Just reference the LINE#HASH anchor.",
 			],
 		parameters: editSchema,
 		prepareArguments: normalizeEditArguments,
 
 		async execute(
 			_toolCallId,
-			params: {
-				path: string;
-				edits: Array<{ op: string; pos: string; end?: string; content: string }>;
-			},
+			params,
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?,
@@ -350,15 +377,15 @@ export default function (pi: ExtensionAPI) {
 
 				const warningText = warnings.length > 0 ? `\nWarnings:\n${warnings.map((w) => `  - ${w}`).join("\n")}` : "";
 
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Successfully edited ${path}.${warningText}`,
-						},
-					],
-					details: { diff, firstChangedLine },
-				};
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Successfully edited ${path}.${warningText}`,
+							},
+						],
+						details: { diff, firstChangedLine },
+					};
 			});
 		},
 		renderCall(args, theme, context) {
@@ -411,4 +438,8 @@ export default function (pi: ExtensionAPI) {
 			return new Container();
 		},
 	});
+
+	pi.registerTool(readImageTool);
+	pi.registerTool(readTool);
+	pi.registerTool(editTool);
 }
