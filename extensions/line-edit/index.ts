@@ -192,6 +192,7 @@ export default function (pi: ExtensionAPI) {
 			"Use read to view files. Output format: LINE#HASH:content (e.g. 5#PM:hello).",
 			"The LINE#HASH anchors are used by the edit tool to identify lines.",
 			"Use offset/limit for large files. Continue with offset until complete.",
+			"If you use glob/find/grep etc. to locate a certain part of the file, try to read around that part using offset and limit.",
 		],
 		parameters: readSchema,
 
