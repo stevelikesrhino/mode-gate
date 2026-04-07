@@ -1,6 +1,12 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const MODEL_FILTER = ["gemma"];
+const MATRIX_ENV_PATTERN = "matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix";
+const ALIGN_ENV_PATTERN = "aligned\\*?|align\\*?";
+const STRUCTURED_DISPLAY_ENV_PATTERN = `array|${MATRIX_ENV_PATTERN}|${ALIGN_ENV_PATTERN}`;
+const STRUCTURED_DISPLAY_ENV_RE = new RegExp(`\\\\begin\\{(${STRUCTURED_DISPLAY_ENV_PATTERN})\\}`);
+const MATRIX_ENV_RE = new RegExp(`\\\\begin\\{(${MATRIX_ENV_PATTERN})\\}([\\s\\S]*?)\\\\end\\{\\1\\}`, "g");
+const ALIGN_ENV_RE = new RegExp(`\\\\begin\\{(${ALIGN_ENV_PATTERN})\\}([\\s\\S]*?)\\\\end\\{\\1\\}`, "g");
 
 const MATH_SYMBOL_REPLACEMENTS: Record<string, string> = {
   hbar: "ℏ",
@@ -60,6 +66,9 @@ const MATH_SYMBOL_REPLACEMENTS: Record<string, string> = {
   vee: "∨",
   uparrow: "↑",
   downarrow: "↓",
+  Downarrow: "⇓",
+  Uparrow: "⇑",
+  Updownarrow: "⇕",
   updownarrow: "↕",
   nearrow: "↗",
   searrow: "↘",
@@ -94,6 +103,15 @@ const MATH_SYMBOL_REPLACEMENTS: Record<string, string> = {
   div: "÷",
   ast: "∗",
   star: "⋆",
+  sin: "sin",
+  cos: "cos",
+  tan: "tan",
+  sinh: "sinh",
+  cosh: "cosh",
+  tanh: "tanh",
+  log: "log",
+  ln: "ln",
+  exp: "exp",
   oplus: "⊕",
   otimes: "⊗",
   sum: "∑",
@@ -396,29 +414,156 @@ function convertLists(input: string): string {
 }
 
 function convertMathEnvironments(input: string): string {
-  return input.replace(/\\begin\{(equation|align|gather|multline)\}([\s\S]*?)\\end\{\1\}/g, (_m, _env, content) => {
+  return input.replace(/\\begin\{(equation|gather|multline)\}([\s\S]*?)\\end\{\1\}/g, (_m, _env, content) => {
     return `\n$$\n${content.trim()}\n$$\n`;
   });
 }
 
 function convertDisplayMathDelimiters(input: string): string {
   return input.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_m, content) => {
+    if (STRUCTURED_DISPLAY_ENV_RE.test(content)) {
+      return `\n${content.trim()}\n`;
+    }
     return `\n$$\n${content.trim()}\n$$\n`;
   });
 }
 
-function convertArrayEnvironments(input: string): string {
-  return input.replace(/\\begin\{array\}\{[^}]*\}([\s\S]*?)\\end\{array\}/g, (_m, content) => {
-    const rows = content
-      .split(/\\\\/)
-      .map((row) => row.replace(/\\hline/g, "").trim())
-      .map((row) => row.replace(/\s*&\s*/g, " | "))
-      .map((row) => convertCommands(row).trim())
+function toFencedFallback(content: string): string {
+  const safeText = convertCommands(content)
+    .replace(/\r/g, "")
+    .replace(/\\\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!safeText) return "";
+  return `\n\`\`\`text\n${safeText}\n\`\`\`\n`;
+}
+
+function splitLatexRows(content: string): string[] {
+  const normalized = content.replace(/\r/g, "");
+
+  const byDoubleSlash = normalized
+    .split(/\\\\\s*/)
+    .map((row) => row.trim())
+    .filter(Boolean);
+
+  if (byDoubleSlash.length > 1) return byDoubleSlash;
+
+  return normalized
+    .split("\n")
+    .map((row) => row.trim())
+    .map((row) => row.replace(/\\\s*$/, "").trim())
+    .filter(Boolean);
+}
+
+function parseTableRows(content: string): string[][] | undefined {
+  const rows = splitLatexRows(content)
+    .map((row) => row.replace(/\\hline(?=[^A-Za-z]|$)/g, "").replace(/\\cline\{[^}]*\}/g, "").trim())
+    .filter(Boolean);
+
+  if (rows.length === 0) return [];
+
+  const parsedRows: string[][] = [];
+  let width = -1;
+
+  for (const row of rows) {
+    const safeRow = row.replace(/\\&/g, "@@AMP@@");
+    const cells = safeRow
+      .split(/\s*&\s*/)
+      .map((cell) => convertCommands(cell.replace(/@@AMP@@/g, "&")).trim());
+
+    if (cells.length === 0) continue;
+    if (width === -1) width = cells.length;
+    if (cells.length !== width) return undefined;
+
+    parsedRows.push(cells);
+  }
+
+  return parsedRows;
+}
+
+function formatMarkdownTable(rows: string[][]): string {
+  if (rows.length === 0 || rows[0].length === 0) return "";
+
+  const cols = rows[0].length;
+  const header = `| ${new Array(cols).fill(" ").join(" | ")} |`;
+  const separator = `| ${new Array(cols).fill("---").join(" | ")} |`;
+  const body = rows.map((row) => {
+    const cells = row.map((cell) => cell.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim());
+    return `| ${cells.join(" | ")} |`;
+  });
+
+  return `\n${[header, separator, ...body].join("\n")}\n`;
+}
+
+function convertTableEnvironments(input: string): string {
+  const convertContent = (content: string, env?: string): string => {
+    const parsed = parseTableRows(content);
+    if (parsed === undefined) return toFencedFallback(content);
+    if (parsed.length === 0) return "";
+    const formatted = formatMarkdownTable(parsed);
+    if (env === "Bmatrix") {
+      return `\n{\n${formatted.trim()}\n}\n`;
+    }
+    return formatted;
+  };
+
+  let output = input.replace(/\\begin\{array\}\{[^}]*\}([\s\S]*?)\\end\{array\}/g, (_m, content) => {
+    return convertContent(content, "array");
+  });
+
+  output = output.replace(MATRIX_ENV_RE, (_m, env, content) => {
+    return convertContent(content, env);
+  });
+
+  return output;
+}
+
+function convertAlignedEnvironments(input: string): string {
+  return input.replace(ALIGN_ENV_RE, (_m, _env, content) => {
+    const rows = splitLatexRows(content);
+    if (rows.length === 0) return toFencedFallback(content);
+
+    const lines = rows
+      .map((row) => {
+        const cleaned = row
+          .replace(/^\s*&\s*/, "")
+          .replace(/\\\s*$/, "")
+          .replace(/\\&/g, "&")
+          .trim();
+        if (!cleaned) return "";
+        return convertCommands(cleaned).trim();
+      })
       .filter(Boolean);
 
-    if (rows.length === 0) return "";
-    return `\n${rows.join("\n")}\n`;
+    if (lines.length === 0) return toFencedFallback(content);
+    return `\n${lines.join("\n")}\n`;
   });
+}
+
+function replaceLabeledArrowCommands(input: string): string {
+  const formatArrow = (left: string, label: string, right: string, plain: string): string => {
+    const cleanedLabel = convertCommands(label).trim();
+    return cleanedLabel ? `${left}(${cleanedLabel})${right}` : plain;
+  };
+
+  const withXRight = input.replace(/\\xRightarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("═", label, "⇒", "⟹"));
+  const withXLeft = withXRight.replace(/\\xLeftarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("⇐", label, "═", "⟸"));
+  const withXLr = withXLeft.replace(/\\xLeftrightarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("⇐", label, "⇒", "⟺"));
+  const withXRightLower = withXLr.replace(/\\xrightarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("—", label, "→", "⟶"));
+  const withXLeftLower = withXRightLower.replace(/\\xleftarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("←", label, "—", "⟵"));
+  const withXLrLower = withXLeftLower.replace(/\\xleftrightarrow\{((?:[^{}]|\{[^{}]*\})*)\}/g, (_m, label) => formatArrow("←", label, "→", "⟷"));
+
+  return withXLrLower
+    .replace(/\\xRightarrow(?![A-Za-z])/g, "⟹")
+    .replace(/\\xLeftarrow(?![A-Za-z])/g, "⟸")
+    .replace(/\\xLeftrightarrow(?![A-Za-z])/g, "⟺")
+    .replace(/\\xrightarrow(?![A-Za-z])/g, "⟶")
+    .replace(/\\xleftarrow(?![A-Za-z])/g, "⟵")
+    .replace(/\\xleftrightarrow(?![A-Za-z])/g, "⟷");
+}
+
+function hasMathSyntax(content: string): boolean {
+  return /\\[A-Za-z]+|[\^_{}]/.test(content);
 }
 
 function convertStructure(text: string): string {
@@ -432,8 +577,9 @@ function convertStructure(text: string): string {
     prev = current;
     iterations++;
     current = convertDisplayMathDelimiters(current);
+    current = convertTableEnvironments(current);
+    current = convertAlignedEnvironments(current);
     current = convertMathEnvironments(current);
-    current = convertArrayEnvironments(current);
     current = convertLists(current);
     current = convertCommands(current);
   }
@@ -449,18 +595,19 @@ function latexToMarkdown(text: string): string {
   let currentText = convertStructure(text);
 
   // 5. Common Math Symbols
+  currentText = replaceLabeledArrowCommands(currentText);
   currentText = replaceKnownLatexCommands(currentText, MATH_SYMBOL_REPLACEMENTS)
-    .replace(/\\%/g, "%")
-    .replace(/\\xrightarrow\{([^}]*)\}/g, "—($1)→")
-    .replace(/\\xleftarrow\{([^}]*)\}/g, "←($1)—")
-    .replace(/\\xRightarrow\{([^}]*)\}/g, "⇒($1)")
-    .replace(/\\xLeftarrow\{([^}]*)\}/g, "⇐($1)")
-    .replace(/\\xLeftrightarrow\{([^}]*)\}/g, "⇔($1)")
-    .replace(/\\xleftrightarrow\{([^}]*)\}/g, "↔($1)");
+    .replace(/\\%/g, "%");
 
   // 6. Delimiters
-  // Block math: $$...$$ -> ensure newlines
-  currentText = currentText.replace(/\$\$\s*([\s\S]*?)\s*\$\$/g, "\n$$\n$1\n$$\n");
+  // Block math: unwrap when it's flow/text, keep delimiters for real math syntax.
+  currentText = currentText.replace(/\$\$\s*([\s\S]*?)\s*\$\$/g, (_m, content) => {
+    const trimmed = content.trim();
+    if (!hasMathSyntax(trimmed)) {
+      return `\n${trimmed}\n`;
+    }
+    return `\n$$\n${trimmed}\n$$\n`;
+  });
 
   // Inline math: $...$ -> remove delimiters if NO LaTeX commands remain
   currentText = currentText.replace(/\$([^\$\n\r]*?)\$/g, (_, content) => {
@@ -472,6 +619,9 @@ function latexToMarkdown(text: string): string {
 
   // 7. Cleanup remaining LaTeX artifacts
   currentText = currentText
+    .replace(/^\s*\$\s*\$\s*/gm, "")
+    .replace(/^\s*\$\s*$/gm, "")
+    .replace(/\$\s*\$/g, " ")
     .replace(/\\noindent(?=[^A-Za-z]|$)\s*/g, "")
     .replace(/\\par(?=[^A-Za-z]|$)\s*/g, "\n\n")
     .replace(/\\quad(?=[^A-Za-z]|$)\s*/g, "  ")
