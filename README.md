@@ -2,7 +2,9 @@
 
 为 [PI Coding Agent](https://github.com/badlogic/pi-mono) 设计的三模式权限控制系统，控制 AI 可以执行的操作。
 
-#### 更新： 添加line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
+#### 更新：
+- 添加 line-edit：行数+哈希算法为基础的编辑工具，防止千问3.5 + llama.cpp造成的Tokenizer问题无法正确匹配中文(CJK)+英文的新旧字符串，导致无法编辑特定文档。Opus完成了大部分的代码。
+- 添加 latex2md：将 AI 输出的 LaTeX 格式和数学符号转换为易读的 Markdown 文本。
 
 - 示例：
 > 喵喵喵喵is a cat <br>
@@ -100,7 +102,9 @@ MIT
 
 A three-mode permission control system for [PI Coding Agent](https://github.com/badlogic/pi-mono), controlling what the AI can do.
 
-### Update: Added line-edit — a line-number + hash based editing tool to work around Qwen3.5 + llama.cpp tokenizer issues that prevent correct matching of CJK+English old/new strings, making certain documents uneditable. Opus wrote most of the code. Opt out if you're not using CJK characters.
+### Update:
+- Added line-edit — a line-number + hash based editing tool to work around Qwen3.5 + llama.cpp tokenizer issues that prevent correct matching of CJK+English old/new strings, making certain documents uneditable. Opus wrote most of the code. Opt out if you're not using CJK characters.
+- Added latex2md — converts LaTeX formatting and math symbols in AI responses to readable Markdown.
 
 Example:
 > 喵喵喵喵is a cat <br>
