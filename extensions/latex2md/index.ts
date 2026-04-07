@@ -401,6 +401,26 @@ function convertMathEnvironments(input: string): string {
   });
 }
 
+function convertDisplayMathDelimiters(input: string): string {
+  return input.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_m, content) => {
+    return `\n$$\n${content.trim()}\n$$\n`;
+  });
+}
+
+function convertArrayEnvironments(input: string): string {
+  return input.replace(/\\begin\{array\}\{[^}]*\}([\s\S]*?)\\end\{array\}/g, (_m, content) => {
+    const rows = content
+      .split(/\\\\/)
+      .map((row) => row.replace(/\\hline/g, "").trim())
+      .map((row) => row.replace(/\s*&\s*/g, " | "))
+      .map((row) => convertCommands(row).trim())
+      .filter(Boolean);
+
+    if (rows.length === 0) return "";
+    return `\n${rows.join("\n")}\n`;
+  });
+}
+
 function convertStructure(text: string): string {
   let prev = "";
   let current = text;
@@ -411,7 +431,9 @@ function convertStructure(text: string): string {
   while (current !== prev && iterations < MAX_ITERATIONS) {
     prev = current;
     iterations++;
+    current = convertDisplayMathDelimiters(current);
     current = convertMathEnvironments(current);
+    current = convertArrayEnvironments(current);
     current = convertLists(current);
     current = convertCommands(current);
   }
@@ -430,7 +452,11 @@ function latexToMarkdown(text: string): string {
   currentText = replaceKnownLatexCommands(currentText, MATH_SYMBOL_REPLACEMENTS)
     .replace(/\\%/g, "%")
     .replace(/\\xrightarrow\{([^}]*)\}/g, "—($1)→")
-    .replace(/\\xleftarrow\{([^}]*)\}/g, "←($1)—");
+    .replace(/\\xleftarrow\{([^}]*)\}/g, "←($1)—")
+    .replace(/\\xRightarrow\{([^}]*)\}/g, "⇒($1)")
+    .replace(/\\xLeftarrow\{([^}]*)\}/g, "⇐($1)")
+    .replace(/\\xLeftrightarrow\{([^}]*)\}/g, "⇔($1)")
+    .replace(/\\xleftrightarrow\{([^}]*)\}/g, "↔($1)");
 
   // 6. Delimiters
   // Block math: $$...$$ -> ensure newlines
