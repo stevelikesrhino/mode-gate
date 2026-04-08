@@ -75,6 +75,9 @@
 
 `skills/` 文件夹包含我个人使用的工作流技能（init、load、save）。
 
+## 配置
+- **修改 grep 提示工具**：在 `extensions/line-edit/index.ts` 中修改 `DEFAULT_GREP` 常量，以更改提示 AI 使用的工具名称（例如将其改为 `rg`）。
+
 ## 安装
 
 1. 安装 PI Coding Agent：`npm install -g @mariozechner/pi-coding-agent`
@@ -174,6 +177,9 @@ In watched mode confirmation dialogs:
 ## Skills
 
 The `skills/` folder contains personal workflow skills (init, load, save) for my own use.
+
+## Configuration
+- **Change grep nudge tool**: Modify the `DEFAULT_GREP` constant in `extensions/line-edit/index.ts` to change the tool name suggested to the AI in nudge messages (e.g., change it to `rg`).
 
 ## Install
 
