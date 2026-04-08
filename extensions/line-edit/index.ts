@@ -35,6 +35,8 @@ import {
 	truncateContent,
 } from "./utils";
 
+const DEFAULT_GREP = "grep";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Edit preview computation (for renderCall)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -157,6 +159,9 @@ const getSystemReadTool = (cwd?: string) => createReadToolDefinition(cwd ?? proc
 const systemReadTool = getSystemReadTool();
 
 export default function (pi: ExtensionAPI) {
+	const fullReadCountsByFile = new Map<string, number>();
+	const grepNudgeToolCallIds = new Set<string>();
+
 	// ─── Add read_image (delegate to system read) ─────────────────────────
 	const readImageTool = defineTool({
 		name: "read_image",
@@ -197,12 +202,12 @@ export default function (pi: ExtensionAPI) {
 		parameters: readSchema,
 
 			async execute(
-				_toolCallId,
-				params,
-				signal?: AbortSignal,
-				_onUpdate?,
-				ctx?,
-			) {
+					toolCallId,
+					params,
+					signal?: AbortSignal,
+					_onUpdate?,
+					ctx?,
+				) {
 			const { path, offset, limit } = params;
 			const absolutePath = resolve(ctx?.cwd ?? process.cwd(), path);
 
@@ -251,26 +256,35 @@ export default function (pi: ExtensionAPI) {
 				})
 				.join("\n");
 
-			// Truncate if needed
-			const { content: truncContent, truncated, shownLines } = truncateContent(hashFormatted);
+				// Truncate if needed
+					const { content: truncContent, truncated, shownLines } = truncateContent(hashFormatted);
+					if (truncated) {
+						const fullReadCount = (fullReadCountsByFile.get(absolutePath) ?? 0) + 1;
+						fullReadCountsByFile.set(absolutePath, fullReadCount);
+						if (fullReadCount >= 2) {
+							grepNudgeToolCallIds.add(toolCallId);
+						}
+					}
 
-			let truncationNotice: string | undefined;
-			if (truncated) {
-				const endShown = startLineNum + shownLines - 1;
-				truncationNotice = `[Showing lines ${startLineNum}-${endShown} of ${totalLines}. Use offset=${endShown + 1} to continue.]`;
+				let truncationNotice: string | undefined;
+				if (truncated) {
+					const endShown = startLineNum + shownLines - 1;
+					truncationNotice = `[Showing lines ${startLineNum}-${endShown} of ${totalLines}. Use offset=${endShown + 1} to continue.]`;
 			} else if (userLimited) {
 				const endShown = startLineNum + selectedLines.length - 1;
 				const remaining = totalLines - (startLine + selectedLines.length);
 				truncationNotice = `[${remaining} more lines. Use offset=${endShown + 1} to continue.]`;
 			}
 
-			const outputText = truncationNotice ? `${truncContent}\n\n${truncationNotice}` : truncContent;
+					const outputParts = [truncContent];
+					if (truncationNotice) outputParts.push(truncationNotice);
+					const outputText = outputParts.join("\n\n");
 
-				return {
-					content: [{ type: "text", text: outputText }],
-					details: { lines: totalLines, truncationNotice },
-				};
-			},
+						return {
+							content: [{ type: "text", text: outputText }],
+							details: { lines: totalLines, truncationNotice },
+						};
+					},
 		renderResult(result, options, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			const rawContent = result.content[0]?.text ?? "";
@@ -294,16 +308,35 @@ export default function (pi: ExtensionAPI) {
 				output += `\n${theme.fg("muted", `... (${contentLines.length - maxLines} more lines)`)} ${keyHint("app.tools.expand", "to expand")}`;
 			}
 
-			// Show truncation notice from details
-			const truncationNotice = result.details?.truncationNotice;
-			if (truncationNotice) {
-				output += `\n${theme.fg("warning", truncationNotice)}`;
-			}
+				// Show truncation notice from details
+				const truncationNotice = result.details?.truncationNotice;
+				if (truncationNotice) {
+					output += `\n${theme.fg("warning", truncationNotice)}`;
+				}
+				text.setText(output);
+				return text;
+			},
+		});
 
-			text.setText(output);
-			return text;
-		},
-	});
+		pi.on("tool_result", async (event) => {
+			if (event.toolName !== "read") return;
+			if (!grepNudgeToolCallIds.has(event.toolCallId)) return;
+			grepNudgeToolCallIds.delete(event.toolCallId);
+
+			pi.sendMessage({
+				customType: "line-edit",
+				content: `Use [${DEFAULT_GREP}] to narrow range before the next read.`,
+				display: true,
+			}, {
+				deliverAs: "steer",
+			});
+		});
+
+		pi.on("tool_call", async (event) => {
+			if (event.toolName === "read") return;
+			fullReadCountsByFile.clear();
+			grepNudgeToolCallIds.clear();
+		});
 
 	// ─── Override edit ───────────────────────────────────────────────────
 	const editTool = defineTool({

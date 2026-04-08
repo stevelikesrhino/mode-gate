@@ -130,6 +130,7 @@ const MATH_SYMBOL_REPLACEMENTS: Record<string, string> = {
   dots: "...",
   prime: "′",
   degree: "°",
+  checkmark: "✓",
 };
 
 function replaceKnownLatexCommands(input: string, replacements: Record<string, string>): string {

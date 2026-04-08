@@ -509,7 +509,7 @@ export function generateSimpleDiff(
 // ═══════════════════════════════════════════════════════════════════════════
 
 const MAX_LINES = 2000;
-const MAX_BYTES = 50 * 1024;
+const MAX_BYTES = 20 * 1024;
 
 export function truncateContent(text: string): { content: string; truncated: boolean; totalLines: number; shownLines: number } {
 	const lines = text.split("\n");
