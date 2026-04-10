@@ -28,7 +28,7 @@ const MODE_LABELS: Record<Mode, string> = {
 
 export default function modeGateExtension(pi: ExtensionAPI): void {
 	let currentMode: Mode = "explore";
-	let modeChanged = true;
+	let lastActiveMode: Mode | undefined = undefined;
 
 	// Per-tool-type "allow all this response" flags, reset on mode change and each turn
 	const allowAll: Record<string, boolean> = {};
@@ -55,7 +55,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	function setMode(mode: Mode, ctx: ExtensionContext): void {
 		if (currentMode === mode) return;
 		currentMode = mode;
-		modeChanged = true;
 		resetAllowAll();
 		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
@@ -102,8 +101,8 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Reset "allow_all" every turn
 	pi.on("before_agent_start", async (event, _ctx) => {
 		resetAllowAll();
-		if (!modeChanged) return;
-		modeChanged = false;
+		if (currentMode === lastActiveMode) return;
+		lastActiveMode = currentMode;
 
 		const content = currentMode === "explore" ? EXPLORE_TEXT :
 			currentMode === "watched" ? WATCHED_TEXT : YOLO_TEXT;
@@ -112,7 +111,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 			message: {
 				customType: "system-reminder",
 				content,
-				display: false,
+				display: true,
 			},
 		};
 	});
@@ -281,7 +280,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Always start in explore mode
 	pi.on("session_start", async (_event, ctx) => {
 		currentMode = "explore";
-		modeChanged = true;
+		lastActiveMode = undefined;
 		resetAllowAll();
 		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
