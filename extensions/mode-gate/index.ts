@@ -111,7 +111,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 			message: {
 				customType: "system-reminder",
 				content,
-				display: true,
+				display: false,
 			},
 		};
 	});
