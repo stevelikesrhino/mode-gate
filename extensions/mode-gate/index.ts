@@ -28,6 +28,7 @@ const MODE_LABELS: Record<Mode, string> = {
 
 export default function modeGateExtension(pi: ExtensionAPI): void {
 	let currentMode: Mode = "explore";
+	let modeChanged = true;
 
 	// Per-tool-type "allow all this response" flags, reset on mode change and each turn
 	const allowAll: Record<string, boolean> = {};
@@ -37,12 +38,9 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	const EXPLORE_BLOCKED = "BLOCKED: you are in explore mode — only read-only tools and safe commands are permitted. Do NOT retry. Do NOT use bash to write/edit files. Describe what you would change instead, concisely.";
-	const EXPLORE_REMINDER =
-		'<system-reminder>You are in explore mode, you cannot write or edit or make file changes.</system-reminder>';
-	const WATCHED_REMINDER =
-		"<system-reminder>You are in watched mode. Read-only tools are fine, but edits, writes, and destructive bash commands require user approval. Plan accordingly and do not assume approval.</system-reminder>";
-	const YOLO_REMINDER =
-		"<system-reminder>You are in YOLO mode. Satisfy user's request by all means.</system-reminder>";
+	const EXPLORE_TEXT = "User activated explore mode, you cannot write or edit or make file changes.";
+	const WATCHED_TEXT = "User activated watched mode. Read-only tools are fine, but edits, writes, and destructive bash commands require user approval. Plan accordingly and do not assume approval.";
+	const YOLO_TEXT = "User activated YOLO mode. Satisfy user's request by all means.";
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (currentMode === "watched") {
@@ -55,7 +53,9 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	function setMode(mode: Mode, ctx: ExtensionContext): void {
+		if (currentMode === mode) return;
 		currentMode = mode;
+		modeChanged = true;
 		resetAllowAll();
 		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
@@ -102,22 +102,19 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Reset "allow_all" every turn
 	pi.on("before_agent_start", async (event, _ctx) => {
 		resetAllowAll();
-		if (currentMode === "explore") {
-			return {
-				systemPrompt: `${event.systemPrompt}\n\n${EXPLORE_REMINDER}`,
-			};
-		}
-		if (currentMode === "watched") {
-			return {
-				systemPrompt: `${event.systemPrompt}\n\n${WATCHED_REMINDER}`,
-			};
-		}
-		if (currentMode === "yolo") {
-			return {
-				systemPrompt: `${event.systemPrompt}\n\n${YOLO_REMINDER}`,
-			};
-		}
-		return;
+		if (!modeChanged) return;
+		modeChanged = false;
+
+		const content = currentMode === "explore" ? EXPLORE_TEXT :
+			currentMode === "watched" ? WATCHED_TEXT : YOLO_TEXT;
+
+		return {
+			message: {
+				customType: "system-reminder",
+				content,
+				display: false,
+			},
+		};
 	});
 
 	// Shared confirmation dialog with optional Tab-to-add-message
@@ -284,6 +281,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Always start in explore mode
 	pi.on("session_start", async (_event, ctx) => {
 		currentMode = "explore";
+		modeChanged = true;
 		resetAllowAll();
 		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
