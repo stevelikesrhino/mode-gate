@@ -143,48 +143,41 @@ function parseEditContent(content: string): string[] {
 	if (content === "") return [];
 
 	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	return normalized.split("\n");
-}
-
-function stripTrailingWhitespace(text: string): string {
-	const parts = text.split(/(\r\n|\n|\r)/);
-	let result = "";
-
-	for (let i = 0; i < parts.length; i++) {
-		const part = parts[i];
-		if (part === undefined) continue;
-		result += i % 2 === 0 ? part.replace(/\s+$/g, "") : part;
+	const lines = normalized.split("\n");
+	if (lines.length > 1 && lines[lines.length - 1] === "") {
+		lines.pop();
 	}
-
-	return result;
+	return lines;
 }
 
-function normalizeEditContent(content: string, filePath: string): string {
-	const isMarkdown = /\.(md|mdx)$/i.test(filePath);
-	return isMarkdown ? content : stripTrailingWhitespace(content);
+function parseInsertContent(content: string): string[] {
+	const lines = parseEditContent(content);
+	return lines.length === 0 ? [""] : lines;
 }
 
 export function parseRawEdits(
 	rawEdits: Array<{ op: string; pos: string; end?: string; content: string }>,
-	filePath: string,
+	_filePath: string,
 ): HashlineEdit[] {
 	return rawEdits.map((raw) => {
-		const lines = parseEditContent(normalizeEditContent(raw.content, filePath));
-
 		switch (raw.op) {
 			case "replace": {
+				const lines = parseEditContent(raw.content);
 				return { op: "replace", pos: parseTag(raw.pos), lines };
 			}
 			case "replace_range": {
 				if (!raw.end) {
 					throw new Error(`replace_range requires an "end" anchor.`);
 				}
+				const lines = parseEditContent(raw.content);
 				return { op: "replace_range", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
 			}
 			case "insert_after": {
+				const lines = parseInsertContent(raw.content);
 				return { op: "insert_after", pos: parseTag(raw.pos), lines };
 			}
 			case "insert_before": {
+				const lines = parseInsertContent(raw.content);
 				return { op: "insert_before", pos: parseTag(raw.pos), lines };
 			}
 			default:
@@ -227,7 +220,6 @@ export function applyHashlineEdits(
 			case "insert_after":
 			case "insert_before":
 				validateRef(edit.pos, fileLines, mismatches);
-				if (edit.lines.length === 0) edit.lines = [""];
 				break;
 		}
 	}
@@ -235,10 +227,15 @@ export function applyHashlineEdits(
 		throw new HashlineMismatchError(mismatches, fileLines);
 	}
 
-	validateEditConflicts(edits);
+	const effectiveEdits = edits.filter((edit) => (edit.op !== "insert_after" && edit.op !== "insert_before") || edit.lines.length > 0);
+	if (effectiveEdits.length === 0) {
+		return { result: text, firstChangedLine: undefined, warnings };
+	}
+
+	validateEditConflicts(effectiveEdits);
 
 	// Boundary duplication warning
-	for (const edit of edits) {
+	for (const edit of effectiveEdits) {
 		if (edit.op !== "replace" && edit.op !== "replace_range") continue;
 		const endLine = edit.op === "replace_range" ? edit.end.line : edit.pos.line;
 		if (edit.lines.length === 0) continue;
@@ -258,8 +255,8 @@ export function applyHashlineEdits(
 	// Deduplicate identical edits
 	const seen = new Set<string>();
 	const deduped: Array<{ edit: HashlineEdit; idx: number }> = [];
-	for (let i = 0; i < edits.length; i++) {
-		const edit = edits[i];
+	for (let i = 0; i < effectiveEdits.length; i++) {
+		const edit = effectiveEdits[i];
 		let key: string;
 		switch (edit.op) {
 			case "replace":
