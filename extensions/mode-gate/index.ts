@@ -289,13 +289,11 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		pi.registerTool({
 			name: "mode-guideline",
 			label: "Mode Gate",
-			description: "This tool is NOT callable.",
-			promptGuidelines: [
-				"Mode: explore — you cannot write or edit or make file changes.",
-				"Mode: watched — edits, writes, and destructive bash commands require user approval.",
-				"Mode: yolo — full access with no prompts.",
-				"Default explore mode.",
-			],
+			description: "This tool is NOT callable.\n"+
+			"- Mode: explore — you cannot write or edit or make file changes.\n"+
+			"- Mode: watched — edits, writes, and destructive bash commands require user approval.\n"+
+			"- Mode: yolo — full access with no prompts.\n"+
+			"- Default explore mode.\n",
 			parameters: Type.Object({}),
 			async execute() {
 				throw new Error("mode_gate_internal should never be called");
