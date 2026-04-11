@@ -294,6 +294,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 				"Mode: explore — you cannot write or edit or make file changes.",
 				"Mode: watched — edits, writes, and destructive bash commands require user approval.",
 				"Mode: yolo — full access with no prompts.",
+				"Default explore mode.",
 			],
 			parameters: Type.Object({}),
 			async execute() {
