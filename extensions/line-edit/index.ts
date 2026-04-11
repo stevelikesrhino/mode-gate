@@ -119,7 +119,7 @@ const editSchema = Type.Object({
 				}),
 			),
 			content: Type.String({
-				description: "Replacement or insertion text. Use newlines for multiple lines. Empty string to delete.",
+				description: "Replacement or insertion text. Use newlines for multiple lines. Empty replacement deletes; empty insertion adds a blank line.",
 			}),
 		}),
 	),
@@ -351,7 +351,7 @@ export default function (pi: ExtensionAPI) {
 				"Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.",
 				"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
 				"Operations: replace (single line), replace_range (pos to end inclusive), insert_after, insert_before.",
-				"content is the replacement/insertion text. Use \\n for multiple lines. Empty string deletes lines.",
+				"content is the replacement/insertion text. Use \\n for multiple lines. Empty replacement deletes lines; empty insertion adds a blank line.",
 				"Never include LINE#HASH: prefixes in content. content must contain plain file text only.",
 				"When editing code, prefer structurally complete edits. Do not replace only part of a function, class, loop, conditional, or try/catch block if that would leave duplicated, missing, or unbalanced lines.",
 				"Before submitting an edit, check that the result will not duplicate adjacent lines or drop required lines such as braces, return statements, or closing delimiters.",
