@@ -46,6 +46,7 @@ export const MATH_SYMBOL_REPLACEMENTS: Record<string, string> = {
   Rightarrow: "⇒",
   Leftarrow: "⇐",
   Leftrightarrow: "⇔",
+  leftrightarrow: "↔",
   rightarrow: "→",
   to: "→",
   leftarrow: "←",
