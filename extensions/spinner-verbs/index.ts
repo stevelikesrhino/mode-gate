@@ -1,5 +1,58 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+// Dynamic color in range 100-150
+let currentColor: [number, number, number] = [150, 130, 0];
+
+function randomColor(): [number, number, number] {
+	return [
+		Math.floor(Math.random() * 51) + 100,
+		Math.floor(Math.random() * 51) + 100,
+		Math.floor(Math.random() * 51) + 100,
+	] as [number, number, number];
+}
+
+function brighten(rgb: [number, number, number], factor: number): string {
+	const [r, g, b] = rgb.map((c) => Math.round(c + (255 - c) * factor));
+	return `\x1b[38;2;${r};${g};${b}m`;
+}
+
+function colorize(text: string, shinePos: number): string {
+	return (
+		[...text]
+			.map((c, i) => {
+				let factor = 0;
+				if (shinePos >= 0) {
+					const dist = Math.abs(i - shinePos);
+					if (dist === 0) factor = 0.7;
+					else if (dist === 1) factor = 0.35;
+				}
+				return `${brighten(currentColor, factor)}${c}`;
+			})
+			.join("") + "\x1b[0m"
+	);
+}
+
+let currentVerb = "";
+let animationFrame = 0;
+let animationTimer: ReturnType<typeof setInterval> | undefined;
+
+function startRainbowAnimation(ctx: Parameters<ExtensionAPI>[0]["on"]["turn_start"]): void {
+	if (animationTimer) return;
+	animationTimer = setInterval(() => {
+		animationFrame++;
+		const cycle = animationFrame % 20;
+		const shinePos = cycle < 10 ? cycle : -1;
+		const rainbowVerb = colorize(currentVerb + "...", shinePos);
+		ctx.ui.setWorkingMessage(`${rainbowVerb}`);
+	}, 60);
+}
+
+function stopRainbowAnimation(): void {
+	if (animationTimer) {
+		clearInterval(animationTimer);
+		animationTimer = undefined;
+	}
+}
 const SPINNER_VERBS = [
   'Accomplishing',
   'Actioning',
@@ -261,12 +314,16 @@ const SPINNER_VERBS = [
 ];
 
 export default function (pi: ExtensionAPI) {
-  pi.on("turn_start", async (_event, ctx) => {
-    const verb = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
-    ctx.ui.setWorkingMessage(`${verb}...`);
-  });
+	pi.on("turn_start", async (_event, ctx) => {
+		const verb = SPINNER_VERBS[Math.floor(Math.random() * SPINNER_VERBS.length)];
+		currentVerb = verb;
+		currentColor = randomColor();
+		startRainbowAnimation(ctx);
+	});
 
-  pi.on("turn_end", async (_event, ctx) => {
-    ctx.ui.setWorkingMessage();
-  });
+	pi.on("turn_end", async (_event, ctx) => {
+		stopRainbowAnimation();
+		ctx.ui.setWorkingMessage();
+		animationFrame = 0;
+	});
 }
