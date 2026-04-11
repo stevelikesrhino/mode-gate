@@ -12,13 +12,14 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
 
 const MODES: Mode[] = ["explore", "watched", "yolo"];
 
-const ALL_TOOLS = ["read", "read_image", "bash", "edit", "write", "grep", "find", "ls"];
+const ALL_TOOLS = ["read", "read_image", "bash", "edit", "write", "grep", "find", "ls", "mode-guideline"];
 
 const MODE_LABELS: Record<Mode, string> = {
 	watched: "watched",
@@ -38,9 +39,9 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	const EXPLORE_BLOCKED = "BLOCKED: you are in explore mode — only read-only tools and safe commands are permitted. Do NOT retry. Do NOT use bash to write/edit files. Describe what you would change instead, concisely.";
-	const EXPLORE_TEXT = "User activated explore mode, you cannot write or edit or make file changes.";
-	const WATCHED_TEXT = "User activated watched mode. Read-only tools are fine, but edits, writes, and destructive bash commands require user approval. Plan accordingly and do not assume approval.";
-	const YOLO_TEXT = "User activated YOLO mode. Satisfy user's request by all means.";
+	const EXPLORE_TEXT = "Runtime mode is now explore. Do not edit/write files; read-only tools and safe commands only.";
+	const WATCHED_TEXT = "Runtime mode is now watched. Edits/writes/destructive bash require user approval.";
+	const YOLO_TEXT = "Runtime mode is now yolo. Tool calls are not approval-gated by mode-gate.";
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (currentMode === "watched") {
@@ -280,9 +281,24 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Always start in explore mode
 	pi.on("session_start", async (_event, ctx) => {
 		currentMode = "explore";
-		lastActiveMode = undefined;
+		lastActiveMode = "explore";
 		resetAllowAll();
 		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
+		// Register internal tool with mode descriptions in system prompt
+		pi.registerTool({
+			name: "mode-guideline",
+			label: "Mode Gate",
+			description: "This tool is NOT callable.",
+			promptGuidelines: [
+				"Mode: explore — you cannot write or edit or make file changes.",
+				"Mode: watched — edits, writes, and destructive bash commands require user approval.",
+				"Mode: yolo — full access with no prompts.",
+			],
+			parameters: Type.Object({}),
+			async execute() {
+				throw new Error("mode_gate_internal should never be called");
+			},
+		});
 	});
 }
