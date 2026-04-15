@@ -40,8 +40,9 @@ function startRainbowAnimation(ctx: Parameters<ExtensionAPI>[0]["on"]["turn_star
 	if (animationTimer) return;
 	animationTimer = setInterval(() => {
 		animationFrame++;
-		const cycle = animationFrame % 20;
-		const shinePos = cycle < 10 ? cycle : -1;
+		const wordLen = currentVerb.length + 3; // +3 for "..."
+		const cycle = animationFrame % (wordLen + 10); // wordLen frames to shine, 10 to fade
+		const shinePos = cycle < wordLen ? cycle : -1;
 		const rainbowVerb = colorize(currentVerb + "...", shinePos);
 		ctx.ui.setWorkingMessage(`${rainbowVerb}`);
 	}, 60);
