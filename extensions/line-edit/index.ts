@@ -31,7 +31,7 @@ import {
 	formatLineTag,
 	parseRawEdits,
 	applyHashlineEdits,
-	generateSimpleDiff,
+	generateEditDiff,
 	detectLineEnding,
 	normalizeLineEndings,
 	parseDocument,
@@ -81,7 +81,7 @@ async function computeEditPreview(
 		}
 
 		// Generate diff
-		const { diff } = generateSimpleDiff(normalized, newNormalized);
+		const { diff } = generateEditDiff(normalized, parsedEdits, newNormalized);
 
 		return { diff, firstChangedLine };
 	} catch (err: any) {
@@ -410,7 +410,7 @@ export default function (pi: ExtensionAPI) {
 				if (signal?.aborted) throw new Error("Operation aborted");
 
 				// Generate diff for display
-				const { diff } = generateSimpleDiff(normalized, newNormalized);
+				const { diff } = generateEditDiff(normalized, edits, newNormalized);
 
 				const warningText = warnings.length > 0 ? `\nWarnings:\n${warnings.map((w) => `  - ${w}`).join("\n")}` : "";
 

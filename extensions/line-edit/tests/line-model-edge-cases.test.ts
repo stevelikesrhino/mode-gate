@@ -5,6 +5,7 @@ import {
 	applyHashlineEdits,
 	detectLineEnding,
 	formatLineTag,
+	generateEditDiff,
 	generateSimpleDiff,
 	parseDocument,
 	parseRawEdits,
@@ -202,6 +203,113 @@ test("diff deleting a final line after a blank line does not add an EOF marker",
 	assert.equal(
 		generateSimpleDiff("A\n\nB\n\nhello", "A\n\nB\n\n").diff,
 		" 1 A\n 2 \n 3 B\n 4 \n-5 hello",
+	);
+});
+
+test("diff uses ellipsis between distant edit spots", () => {
+	assert.equal(
+		generateSimpleDiff(
+			"one\ntwo\nthree\nfour\nfive\nsix\nseven",
+			"ONE\ntwo\nthree\nfour\nfive\nsix\nSEVEN",
+			1,
+		).diff,
+		"-1 one\n+1 ONE\n 2 two\n   ...\n 6 six\n-7 seven\n+7 SEVEN",
+	);
+});
+
+test("diff uses ellipsis between unlimited distant edit spots", () => {
+	const oldContent = Array.from({ length: 15 }, (_, i) => `line${i + 1}`).join("\n");
+	const newContent = oldContent
+		.replace("line1", "LINE1")
+		.replace("line8", "LINE8")
+		.replace("line15", "LINE15");
+
+	assert.equal(
+		generateSimpleDiff(oldContent, newContent, 1).diff,
+		[
+			"- 1 line1",
+			"+ 1 LINE1",
+			"  2 line2",
+			"    ...",
+			"  7 line7",
+			"- 8 line8",
+			"+ 8 LINE8",
+			"  9 line9",
+			"    ...",
+			" 14 line14",
+			"-15 line15",
+			"+15 LINE15",
+		].join("\n"),
+	);
+});
+
+test("edit diff renders unlimited anchored edits without sliding repeated blank lines", () => {
+	const oldLines = Array.from({ length: 200 }, () => "");
+	oldLines[0] = "aaa";
+	oldLines[1] = "bbb";
+	oldLines[2] = "cc";
+	oldLines[3] = "ddd";
+	oldLines[199] = "https://github.com/ggml-org/llama.cpp/pull/21896";
+	const oldContent = oldLines.join("\n");
+	const rawEdits = [
+		{ op: "replace", pos: formatLineTag(1, "aaa"), end: formatLineTag(1, "aaa"), content: "LINE1!!!" },
+		{ op: "replace", pos: formatLineTag(50, ""), end: formatLineTag(50, ""), content: "LINE50!!!" },
+		{ op: "replace", pos: formatLineTag(100, ""), end: formatLineTag(100, ""), content: "LINE100!!!" },
+		{ op: "replace", pos: formatLineTag(150, ""), end: formatLineTag(150, ""), content: "LINE150!!!" },
+		{ op: "replace", pos: formatLineTag(200, oldLines[199]), end: formatLineTag(200, oldLines[199]), content: "" },
+	];
+	const edits = parseRawEdits(rawEdits, "TEST.md");
+	const newContent = applyHashlineEdits(oldContent, edits).result;
+
+	assert.equal(
+		generateEditDiff(oldContent, edits, newContent).diff,
+		[
+			"-  1 aaa",
+			"+  1 LINE1!!!",
+			"   2 bbb",
+			"   3 cc",
+			"   4 ddd",
+			"   5 ",
+			"     ...",
+			"  46 ",
+			"  47 ",
+			"  48 ",
+			"  49 ",
+			"- 50 ",
+			"+ 50 LINE50!!!",
+			"  51 ",
+			"  52 ",
+			"  53 ",
+			"  54 ",
+			"     ...",
+			"  96 ",
+			"  97 ",
+			"  98 ",
+			"  99 ",
+			"-100 ",
+			"+100 LINE100!!!",
+			" 101 ",
+			" 102 ",
+			" 103 ",
+			" 104 ",
+			"     ...",
+			" 146 ",
+			" 147 ",
+			" 148 ",
+			" 149 ",
+			"-150 ",
+			"+150 LINE150!!!",
+			" 151 ",
+			" 152 ",
+			" 153 ",
+			" 154 ",
+			"     ...",
+			" 196 ",
+			" 197 ",
+			" 198 ",
+			" 199 ",
+			"-200 https://github.com/ggml-org/llama.cpp/pull/21896",
+		].join("\n"),
 	);
 });
 

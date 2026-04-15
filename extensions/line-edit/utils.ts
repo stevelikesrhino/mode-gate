@@ -350,6 +350,10 @@ function formatDiffLine(prefix: "+" | "-" | " ", lineNum: number, width: number,
 	return `${prefix}${String(lineNum).padStart(width)} ${content}`;
 }
 
+function formatDiffEllipsis(width: number): string {
+	return ` ${"".padStart(width, " ")} ...`;
+}
+
 function sameLines(left: string[], right: string[]): boolean {
 	return left.length === right.length && left.every((line, i) => line === right[i]);
 }
@@ -378,6 +382,164 @@ function appendContextBeforeEof(
 function parseDiffDocument(content: string): ParsedDocument {
 	if (content === "") return { lines: [], finalNewline: false };
 	return parseDocument(content);
+}
+
+type EditDiffHunk = {
+	start: number;
+	end: number;
+	edits: HashlineEdit[];
+};
+
+function getEditRange(edit: HashlineEdit): { start: number; end: number } {
+	switch (edit.op) {
+		case "replace":
+			return { start: edit.pos.line, end: edit.end.line };
+		case "insert_before":
+		case "insert_after":
+			return { start: edit.pos.line, end: edit.pos.line };
+	}
+}
+
+function buildEditDiffHunks(edits: HashlineEdit[], oldLineCount: number, contextLines: number): EditDiffHunk[] {
+	const sorted = [...edits].sort((a, b) => {
+		const left = getEditRange(a);
+		const right = getEditRange(b);
+		return left.start - right.start || left.end - right.end;
+	});
+
+	const hunks: EditDiffHunk[] = [];
+	for (const edit of sorted) {
+		const range = getEditRange(edit);
+		const start = Math.max(1, range.start - contextLines);
+		const end = Math.min(oldLineCount, range.end + contextLines);
+		const last = hunks[hunks.length - 1];
+
+		if (last && start <= last.end + 1) {
+			last.end = Math.max(last.end, end);
+			last.edits.push(edit);
+		} else {
+			hunks.push({ start, end, edits: [edit] });
+		}
+	}
+	return hunks;
+}
+
+function appendContextLines(
+	output: string[],
+	lines: string[],
+	from: number,
+	to: number,
+	lineNumWidth: number,
+): void {
+	for (let lineNum = from; lineNum <= to; lineNum++) {
+		const line = lines[lineNum - 1];
+		if (line === undefined) continue;
+		output.push(formatDiffLine(" ", lineNum, lineNumWidth, line));
+	}
+}
+
+function appendAddedLines(
+	output: string[],
+	startLine: number,
+	lines: string[],
+	lineNumWidth: number,
+): void {
+	for (let i = 0; i < lines.length; i++) {
+		output.push(formatDiffLine("+", startLine + i, lineNumWidth, lines[i]));
+	}
+}
+
+function appendRemovedLines(
+	output: string[],
+	oldLines: string[],
+	from: number,
+	to: number,
+	lineNumWidth: number,
+): void {
+	for (let lineNum = from; lineNum <= to; lineNum++) {
+		output.push(formatDiffLine("-", lineNum, lineNumWidth, oldLines[lineNum - 1] ?? ""));
+	}
+}
+
+export function generateEditDiff(
+	oldContent: string,
+	edits: HashlineEdit[],
+	newContent: string,
+	contextLines = 4,
+): { diff: string; firstChangedLine: number | undefined } {
+	const oldDoc = parseDiffDocument(oldContent);
+	const newDoc = parseDiffDocument(newContent);
+	const showEofNewlineChange = shouldShowEofNewlineChange(oldDoc, newDoc);
+	const output: string[] = [];
+	const eofLineNum = Math.max(oldDoc.lines.length, newDoc.lines.length) + 1;
+	const maxLineNum = Math.max(
+		oldDoc.lines.length,
+		newDoc.lines.length,
+		showEofNewlineChange ? eofLineNum : 1,
+		1,
+	);
+	const lineNumWidth = String(maxLineNum).length;
+	let firstChangedLine: number | undefined;
+	let previousHunkEnd: number | undefined;
+
+	for (const hunk of buildEditDiffHunks(edits, oldDoc.lines.length, contextLines)) {
+		if (previousHunkEnd !== undefined && hunk.start > previousHunkEnd + 1) {
+			output.push(formatDiffEllipsis(lineNumWidth));
+		}
+		previousHunkEnd = hunk.end;
+
+		let cursor = hunk.start;
+		for (const edit of hunk.edits) {
+			const range = getEditRange(edit);
+
+			if (edit.op === "insert_after") {
+				appendContextLines(output, oldDoc.lines, cursor, edit.pos.line, lineNumWidth);
+				cursor = edit.pos.line + 1;
+				appendAddedLines(output, edit.pos.line + 1, edit.lines, lineNumWidth);
+				if (firstChangedLine === undefined) firstChangedLine = edit.pos.line + 1;
+				continue;
+			}
+
+			appendContextLines(output, oldDoc.lines, cursor, range.start - 1, lineNumWidth);
+
+			if (edit.op === "insert_before") {
+				appendAddedLines(output, edit.pos.line, edit.lines, lineNumWidth);
+				if (firstChangedLine === undefined) firstChangedLine = edit.pos.line;
+			} else {
+				appendRemovedLines(output, oldDoc.lines, edit.pos.line, edit.end.line, lineNumWidth);
+				appendAddedLines(output, edit.pos.line, edit.lines, lineNumWidth);
+				cursor = edit.end.line + 1;
+				if (firstChangedLine === undefined) firstChangedLine = edit.pos.line;
+			}
+		}
+
+		appendContextLines(output, oldDoc.lines, cursor, hunk.end, lineNumWidth);
+	}
+
+	if (showEofNewlineChange) {
+		if (output.length === 0) {
+			appendContextBeforeEof(output, oldDoc.lines, lineNumWidth, contextLines);
+		} else if (previousHunkEnd !== undefined && oldDoc.lines.length - previousHunkEnd > contextLines) {
+			output.push(formatDiffEllipsis(lineNumWidth));
+			appendContextBeforeEof(output, oldDoc.lines, lineNumWidth, contextLines);
+		}
+
+		if (oldDoc.finalNewline) {
+			output.push(formatDiffLine("-", oldDoc.lines.length + 1, lineNumWidth, "<EOF newline>"));
+		} else {
+			output.push(formatDiffLine("+", newDoc.lines.length + 1, lineNumWidth, "<EOF newline>"));
+		}
+
+		if (firstChangedLine === undefined) {
+			firstChangedLine = newDoc.lines.length + 1;
+		}
+	}
+
+	if (output.length === 0) {
+		return generateSimpleDiff(oldContent, newContent, contextLines);
+	}
+
+	return { diff: output.join("\n"), firstChangedLine };
 }
 
 export function generateSimpleDiff(
@@ -423,18 +585,43 @@ export function generateSimpleDiff(
 				}
 			}
 			lastWasChange = true;
-		} else {
-			const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
+			} else {
+				const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
 
-			if (lastWasChange || nextPartIsChange) {
-				let linesToShow = raw;
-				let skipStart = 0;
-				let skipEnd = 0;
+				if (lastWasChange || nextPartIsChange) {
+					let linesToShow = raw;
+					let skipStart = 0;
+					let skipEnd = 0;
 
-				if (!lastWasChange) {
-					skipStart = Math.max(0, raw.length - contextLines);
-					linesToShow = raw.slice(skipStart);
-				}
+					if (lastWasChange && nextPartIsChange && raw.length > contextLines * 2) {
+						const leadingLines = raw.slice(0, contextLines);
+						const trailingLines = raw.slice(raw.length - contextLines);
+						const skippedLines = raw.length - leadingLines.length - trailingLines.length;
+
+						for (const line of leadingLines) {
+							output.push(formatDiffLine(" ", oldLineNum, lineNumWidth, line));
+							oldLineNum++;
+							newLineNum++;
+						}
+
+						output.push(formatDiffEllipsis(lineNumWidth));
+						oldLineNum += skippedLines;
+						newLineNum += skippedLines;
+
+						for (const line of trailingLines) {
+							output.push(formatDiffLine(" ", oldLineNum, lineNumWidth, line));
+							oldLineNum++;
+							newLineNum++;
+						}
+
+						lastWasChange = false;
+						continue;
+					}
+
+					if (!lastWasChange) {
+						skipStart = Math.max(0, raw.length - contextLines);
+						linesToShow = raw.slice(skipStart);
+					}
 
 				if (!nextPartIsChange && linesToShow.length > contextLines) {
 					skipEnd = linesToShow.length - contextLines;
