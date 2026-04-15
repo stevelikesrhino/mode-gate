@@ -71,12 +71,17 @@ export interface HashMismatch {
 const MISMATCH_CONTEXT = 2;
 
 export class HashlineMismatchError extends Error {
+	public readonly mismatches: HashMismatch[];
+	public readonly fileLines: string[];
+
 	constructor(
-		public readonly mismatches: HashMismatch[],
-		public readonly fileLines: string[],
+		mismatches: HashMismatch[],
+		fileLines: string[],
 	) {
 		super(HashlineMismatchError.formatMessage(mismatches, fileLines));
 		this.name = "HashlineMismatchError";
+		this.mismatches = mismatches;
+		this.fileLines = fileLines;
 	}
 
 	static formatMessage(mismatches: HashMismatch[], fileLines: string[]): string {
@@ -132,22 +137,55 @@ export function validateRef(ref: Anchor, fileLines: string[], mismatches: HashMi
 // --- Edit types ---
 
 export type HashlineEdit =
-	| { op: "replace"; pos: Anchor; lines: string[] }
-	| { op: "replace_range"; pos: Anchor; end: Anchor; lines: string[] }
+	| { op: "replace"; pos: Anchor; end: Anchor; lines: string[] }
 	| { op: "insert_after"; pos: Anchor; lines: string[] }
 	| { op: "insert_before"; pos: Anchor; lines: string[] };
 
 // --- Parse raw edits ---
 
+export interface ParsedDocument {
+	lines: string[];
+	finalNewline: boolean;
+}
+
+export type LineEnding = "\n" | "\r\n" | "\r";
+
+export function detectLineEnding(content: string): LineEnding {
+	if (content.includes("\r\n")) return "\r\n";
+	if (content.includes("\r")) return "\r";
+	return "\n";
+}
+
+export function normalizeLineEndings(content: string): string {
+	return content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+export function restoreLineEndings(content: string, lineEnding: LineEnding): string {
+	return lineEnding === "\n" ? content : content.replace(/\n/g, lineEnding);
+}
+
+export function parseDocument(content: string): ParsedDocument {
+	const normalized = normalizeLineEndings(content);
+	const finalNewline = normalized.endsWith("\n");
+	const lines = normalized.split("\n");
+	if (finalNewline) {
+		lines.pop();
+	}
+	return { lines, finalNewline };
+}
+
+function serializeDocument(doc: ParsedDocument): string {
+	if (doc.lines.length === 0) return "";
+
+	const body = doc.lines.join("\n");
+	const needsTerminator = doc.finalNewline || doc.lines[doc.lines.length - 1] === "";
+	return needsTerminator ? `${body}\n` : body;
+}
+
 function parseEditContent(content: string): string[] {
 	if (content === "") return [];
 
-	const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	const lines = normalized.split("\n");
-	if (lines.length > 1 && lines[lines.length - 1] === "") {
-		lines.pop();
-	}
-	return lines;
+	return normalizeLineEndings(content).split("\n");
 }
 
 function parseInsertContent(content: string): string[] {
@@ -162,15 +200,11 @@ export function parseRawEdits(
 	return rawEdits.map((raw) => {
 		switch (raw.op) {
 			case "replace": {
-				const lines = parseEditContent(raw.content);
-				return { op: "replace", pos: parseTag(raw.pos), lines };
-			}
-			case "replace_range": {
 				if (!raw.end) {
-					throw new Error(`replace_range requires an "end" anchor.`);
+					throw new Error(`replace requires an "end" anchor.`);
 				}
 				const lines = parseEditContent(raw.content);
-				return { op: "replace_range", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
+				return { op: "replace", pos: parseTag(raw.pos), end: parseTag(raw.end), lines };
 			}
 			case "insert_after": {
 				const lines = parseInsertContent(raw.content);
@@ -181,7 +215,7 @@ export function parseRawEdits(
 				return { op: "insert_before", pos: parseTag(raw.pos), lines };
 			}
 			default:
-				throw new Error(`Unknown op "${raw.op}". Valid: replace, replace_range, insert_after, insert_before`);
+				throw new Error(`Unknown op "${raw.op}". Valid: replace, insert_after, insert_before`);
 		}
 	});
 }
@@ -196,8 +230,8 @@ export function applyHashlineEdits(
 		return { result: text, firstChangedLine: undefined, warnings: [] };
 	}
 
-	const fileLines = text.split("\n");
-	const originalFileLines = [...fileLines];
+	const doc = parseDocument(text);
+	const fileLines = doc.lines;
 	let firstChangedLine: number | undefined;
 	const warnings: string[] = [];
 
@@ -206,10 +240,6 @@ export function applyHashlineEdits(
 	for (const edit of edits) {
 		switch (edit.op) {
 			case "replace": {
-				validateRef(edit.pos, fileLines, mismatches);
-				break;
-			}
-			case "replace_range": {
 				validateRef(edit.pos, fileLines, mismatches);
 				validateRef(edit.end, fileLines, mismatches);
 				if (edit.pos.line > edit.end.line) {
@@ -232,26 +262,6 @@ export function applyHashlineEdits(
 		return { result: text, firstChangedLine: undefined, warnings };
 	}
 
-	validateEditConflicts(effectiveEdits);
-
-	// Boundary duplication warning
-	for (const edit of effectiveEdits) {
-		if (edit.op !== "replace" && edit.op !== "replace_range") continue;
-		const endLine = edit.op === "replace_range" ? edit.end.line : edit.pos.line;
-		if (edit.lines.length === 0) continue;
-		const nextIdx = endLine; // 0-indexed next surviving line
-		if (nextIdx >= originalFileLines.length) continue;
-		const trimmedNext = originalFileLines[nextIdx].trim();
-		const trimmedLast = edit.lines[edit.lines.length - 1].trim();
-		if (trimmedLast.length > 0 && trimmedLast === trimmedNext) {
-			const tag = formatLineTag(endLine + 1, originalFileLines[nextIdx]);
-			warnings.push(
-				`Possible boundary duplication: last replacement line "${trimmedLast}" matches next surviving line ${tag}. ` +
-					`If replacing the full block, set end to ${tag}.`,
-			);
-		}
-	}
-
 	// Deduplicate identical edits
 	const seen = new Set<string>();
 	const deduped: Array<{ edit: HashlineEdit; idx: number }> = [];
@@ -260,9 +270,6 @@ export function applyHashlineEdits(
 		let key: string;
 		switch (edit.op) {
 			case "replace":
-				key = `r:${edit.pos.line}::${edit.lines.join("\n")}`;
-				break;
-			case "replace_range":
 				key = `rr:${edit.pos.line}:${edit.end.line}:${edit.lines.join("\n")}`;
 				break;
 			case "insert_after":
@@ -282,10 +289,6 @@ export function applyHashlineEdits(
 		let precedence: number;
 		switch (edit.op) {
 			case "replace":
-				sortLine = edit.pos.line;
-				precedence = 0;
-				break;
-			case "replace_range":
 				sortLine = edit.end.line;
 				precedence = 0;
 				break;
@@ -306,13 +309,6 @@ export function applyHashlineEdits(
 	for (const { edit } of sorted) {
 		switch (edit.op) {
 			case "replace": {
-				const orig = fileLines[edit.pos.line - 1];
-				if (edit.lines.length === 1 && edit.lines[0] === orig) break; // noop
-				fileLines.splice(edit.pos.line - 1, 1, ...edit.lines);
-				track(edit.pos.line);
-				break;
-			}
-			case "replace_range": {
 				const count = edit.end.line - edit.pos.line + 1;
 				fileLines.splice(edit.pos.line - 1, count, ...edit.lines);
 				track(edit.pos.line);
@@ -329,7 +325,7 @@ export function applyHashlineEdits(
 		}
 	}
 
-	return { result: fileLines.join("\n"), firstChangedLine, warnings };
+	return { result: serializeDocument(doc), firstChangedLine, warnings };
 
 	function track(line: number) {
 		if (firstChangedLine === undefined || line < firstChangedLine) firstChangedLine = line;
@@ -340,70 +336,6 @@ function getInsertBoundary(edit: Extract<HashlineEdit, { op: "insert_after" | "i
 	return edit.op === "insert_before" ? edit.pos.line - 1 : edit.pos.line;
 }
 
-function describeEdit(edit: HashlineEdit): string {
-	switch (edit.op) {
-		case "replace":
-			return `replace at line ${edit.pos.line}`;
-		case "replace_range":
-			return `replace_range ${edit.pos.line}-${edit.end.line}`;
-		case "insert_after":
-			return `insert_after line ${edit.pos.line}`;
-		case "insert_before":
-			return `insert_before line ${edit.pos.line}`;
-	}
-}
-
-function validateEditConflicts(edits: HashlineEdit[]): void {
-	const replacements = edits
-		.filter((edit): edit is Extract<HashlineEdit, { op: "replace" | "replace_range" }> => edit.op === "replace" || edit.op === "replace_range")
-		.map((edit) => ({
-			edit,
-			start: edit.pos.line,
-			end: edit.op === "replace_range" ? edit.end.line : edit.pos.line,
-		}))
-		.sort((a, b) => a.start - b.start || a.end - b.end);
-
-	for (let i = 1; i < replacements.length; i++) {
-		const prev = replacements[i - 1];
-		const current = replacements[i];
-		if (prev.end >= current.start) {
-			throw new Error(
-				`Conflicting edits: ${describeEdit(prev.edit)} overlaps with ${describeEdit(current.edit)}. ` +
-					`Merge them into one replacement block.`,
-			);
-		}
-	}
-
-	const insertions = new Map<number, { edit: Extract<HashlineEdit, { op: "insert_after" | "insert_before" }>; content: string }>();
-	for (const edit of edits) {
-		if (edit.op !== "insert_after" && edit.op !== "insert_before") continue;
-
-		const boundary = getInsertBoundary(edit);
-		const content = edit.lines.join("\n");
-		const existing = insertions.get(boundary);
-		if (existing && existing.content !== content) {
-			throw new Error(
-				`Conflicting edits: ${describeEdit(existing.edit)} and ${describeEdit(edit)} target the same insertion point. ` +
-					`Merge them into one insertion.`,
-			);
-		}
-		if (!existing) {
-			insertions.set(boundary, { edit, content });
-		}
-	}
-
-	for (const { edit, start, end } of replacements) {
-		for (const [boundary, insertion] of insertions) {
-			if (boundary >= start - 1 && boundary <= end) {
-				throw new Error(
-					`Conflicting edits: ${describeEdit(insertion.edit)} touches the same block as ${describeEdit(edit)}. ` +
-						`Merge them into one replacement block.`,
-				);
-			}
-		}
-	}
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Diff generation (Myers algorithm via `diff` package)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -411,15 +343,41 @@ function validateEditConflicts(edits: HashlineEdit[]): void {
 import * as Diff from "diff";
 
 function countContentLines(content: string): number {
-	const lines = content.split("\n");
-	if (lines.length > 1 && lines[lines.length - 1] === "") {
-		lines.pop();
-	}
-	return Math.max(1, lines.length);
+	return Math.max(1, parseDiffDocument(content).lines.length);
 }
 
 function formatDiffLine(prefix: "+" | "-" | " ", lineNum: number, width: number, content: string): string {
 	return `${prefix}${String(lineNum).padStart(width)} ${content}`;
+}
+
+function sameLines(left: string[], right: string[]): boolean {
+	return left.length === right.length && left.every((line, i) => line === right[i]);
+}
+
+function shouldShowEofNewlineChange(oldDoc: ParsedDocument, newDoc: ParsedDocument): boolean {
+	if (oldDoc.finalNewline === newDoc.finalNewline) return false;
+
+	const oldLastLine = oldDoc.lines[oldDoc.lines.length - 1] ?? "";
+	const newLastLine = newDoc.lines[newDoc.lines.length - 1] ?? "";
+
+	return sameLines(oldDoc.lines, newDoc.lines) || (oldLastLine !== "" && newLastLine !== "");
+}
+
+function appendContextBeforeEof(
+	output: string[],
+	lines: string[],
+	lineNumWidth: number,
+	contextLines: number,
+): void {
+	const start = Math.max(0, lines.length - contextLines);
+	for (let i = start; i < lines.length; i++) {
+		output.push(formatDiffLine(" ", i + 1, lineNumWidth, lines[i]));
+	}
+}
+
+function parseDiffDocument(content: string): ParsedDocument {
+	if (content === "") return { lines: [], finalNewline: false };
+	return parseDocument(content);
 }
 
 export function generateSimpleDiff(
@@ -427,10 +385,18 @@ export function generateSimpleDiff(
 	newContent: string,
 	contextLines = 4,
 ): { diff: string; firstChangedLine: number | undefined } {
-	const parts = Diff.diffLines(oldContent, newContent);
+	const oldDoc = parseDiffDocument(oldContent);
+	const newDoc = parseDiffDocument(newContent);
+	const showEofNewlineChange = shouldShowEofNewlineChange(oldDoc, newDoc);
+	const parts = Diff.diffArrays(oldDoc.lines, newDoc.lines);
 	const output: string[] = [];
 
-	const maxLineNum = Math.max(countContentLines(oldContent), countContentLines(newContent));
+	const eofLineNum = Math.max(oldDoc.lines.length, newDoc.lines.length) + 1;
+	const maxLineNum = Math.max(
+		countContentLines(oldContent),
+		countContentLines(newContent),
+		showEofNewlineChange ? eofLineNum : 1,
+	);
 	const lineNumWidth = String(maxLineNum).length;
 
 	let oldLineNum = 1;
@@ -440,10 +406,7 @@ export function generateSimpleDiff(
 
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
-		const raw = part.value.split("\n");
-		if (raw[raw.length - 1] === "") {
-			raw.pop();
-		}
+		const raw = part.value;
 
 		if (part.added || part.removed) {
 			if (firstChangedLine === undefined) {
@@ -495,6 +458,22 @@ export function generateSimpleDiff(
 			}
 
 			lastWasChange = false;
+		}
+	}
+
+	if (showEofNewlineChange) {
+		if (output.length === 0) {
+			appendContextBeforeEof(output, oldDoc.lines, lineNumWidth, contextLines);
+		}
+
+		if (oldDoc.finalNewline) {
+			output.push(formatDiffLine("-", oldDoc.lines.length + 1, lineNumWidth, "<EOF newline>"));
+		} else {
+			output.push(formatDiffLine("+", newDoc.lines.length + 1, lineNumWidth, "<EOF newline>"));
+		}
+
+		if (firstChangedLine === undefined) {
+			firstChangedLine = newDoc.lines.length + 1;
 		}
 	}
 

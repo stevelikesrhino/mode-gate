@@ -32,6 +32,10 @@ import {
 	parseRawEdits,
 	applyHashlineEdits,
 	generateSimpleDiff,
+	detectLineEnding,
+	normalizeLineEndings,
+	parseDocument,
+	restoreLineEndings,
 	truncateContent,
 } from "./utils";
 
@@ -65,8 +69,7 @@ async function computeEditPreview(
 		const rawContent = await readFile(absolutePath, "utf-8");
 		const hasBom = rawContent.startsWith("\uFEFF");
 		const content = hasBom ? rawContent.slice(1) : rawContent;
-		const crlf = content.includes("\r\n");
-		const normalized = crlf ? content.replace(/\r\n/g, "\n") : content;
+		const normalized = normalizeLineEndings(content);
 
 		const parsedEdits = parseRawEdits(edits, path);
 
@@ -101,11 +104,10 @@ const editSchema = Type.Object({
 	edits: Type.Array(
 		Type.Object({
 			op: StringEnum(
-				["replace", "replace_range", "insert_after", "insert_before"],
+				["replace", "insert_after", "insert_before"],
 				{
 					description:
-						"replace: Replace a single line at pos with new content. Use empty content to delete the line. " +
-						"replace_range: Replace multiple lines from pos to end (inclusive). Requires both pos and end. Use empty content to delete the range. " +
+						"replace: Replace lines from pos to end (inclusive). Use the same anchor for pos and end to replace a single line. Use empty content to delete the range. " +
 						"insert_after: Insert new lines immediately after the line at pos. " +
 						"insert_before: Insert new lines immediately before the line at pos.",
 				},
@@ -115,11 +117,11 @@ const editSchema = Type.Object({
 			}),
 			end: Type.Optional(
 				Type.String({
-					description: 'End anchor "LINE#HASH" for replace_range (inclusive). Required when op is "replace_range".',
+					description: 'End anchor "LINE#HASH" for replace (inclusive). Required when op is "replace".',
 				}),
 			),
 			content: Type.String({
-				description: "Replacement or insertion text. Use newlines for multiple lines. Empty replacement deletes; empty insertion adds a blank line.",
+				description: "Replacement or insertion text. Use newlines for multiple lines. A trailing newline is preserved as a blank final line. Empty replacement deletes; empty insertion adds a blank line.",
 			}),
 		}),
 	),
@@ -228,8 +230,8 @@ export default function (pi: ExtensionAPI) {
 
 			const raw = await readFile(absolutePath, "utf-8");
 			const content = raw.startsWith("\uFEFF") ? raw.slice(1) : raw;
-			const normalized = content.replace(/\r\n/g, "\n");
-			const allLines = normalized.split("\n");
+			const normalized = normalizeLineEndings(content);
+			const allLines = parseDocument(normalized).lines;
 			const totalLines = allLines.length;
 
 			const startLine = offset !== undefined ? offset - 1 : 0;
@@ -345,18 +347,19 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Edit a file using LINE#HASH anchors from read output. Supports multiple operations per call. " +
 			"Hashes are validated before any changes — stale references are rejected with updated anchors.",
-		promptSnippet: "Edit file using LINE#HASH anchors (replace, replace_range, insert_after, insert_before)",
+		promptSnippet: "Edit file using LINE#HASH anchors (replace, insert_after, insert_before)",
 			promptGuidelines: [
 				"Always read a file before editing it to get current LINE#HASH anchors.",
 				"Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.",
 				"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
-				"Operations: replace (single line), replace_range (pos to end inclusive), insert_after, insert_before.",
-				"content is the replacement/insertion text. Use \\n for multiple lines. Empty replacement deletes lines; empty insertion adds a blank line.",
+				"Operations: replace (pos to end inclusive), insert_after, insert_before.",
+				"Use replace for single-line replacements by setting pos and end to the same anchor.",
+				"content is the replacement/insertion text. Use \\n for multiple lines. A trailing \\n is preserved as a blank final line. Empty replacement deletes lines; empty insertion adds a blank line.",
 				"Never include LINE#HASH: prefixes in content. content must contain plain file text only.",
 				"When editing code, prefer structurally complete edits. Do not replace only part of a function, class, loop, conditional, or try/catch block if that would leave duplicated, missing, or unbalanced lines.",
 				"Before submitting an edit, check that the result will not duplicate adjacent lines or drop required lines such as braces, return statements, or closing delimiters.",
-				"Example replace: {\"op\":\"replace\",\"pos\":\"6#PM\",\"content\":\"const answer = 42;\"}",
-				"Example replace_range: {\"op\":\"replace_range\",\"pos\":\"5#PM\",\"end\":\"9#NQ\",\"content\":\"if (ok) {\\n  return value;\\n}\"}",
+				"Example single-line replace: {\"op\":\"replace\",\"pos\":\"6#PM\",\"end\":\"6#PM\",\"content\":\"const answer = 42;\"}",
+				"Example multi-line replace: {\"op\":\"replace\",\"pos\":\"5#PM\",\"end\":\"9#NQ\",\"content\":\"if (ok) {\\n  return value;\\n}\"}",
 				"Example insert_after: {\"op\":\"insert_after\",\"pos\":\"12#VR\",\"content\":\"console.log(answer);\"}",
 				"Example insert_before: {\"op\":\"insert_before\",\"pos\":\"3#WS\",\"content\":\"import { foo } from \\\"./foo\\\";\"}",
 				"If hashes don't match (file changed), you'll get updated anchors — retry with those.",
@@ -386,8 +389,8 @@ export default function (pi: ExtensionAPI) {
 				const rawContent = await readFile(absolutePath, "utf-8");
 				const hasBom = rawContent.startsWith("\uFEFF");
 				const content = hasBom ? rawContent.slice(1) : rawContent;
-				const crlf = content.includes("\r\n");
-				const normalized = crlf ? content.replace(/\r\n/g, "\n") : content;
+				const lineEnding = detectLineEnding(content);
+				const normalized = normalizeLineEndings(content);
 
 				const edits = parseRawEdits(rawEdits, path);
 
@@ -401,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Restore line endings and BOM
-				const finalContent = (hasBom ? "\uFEFF" : "") + (crlf ? newNormalized.replace(/\n/g, "\r\n") : newNormalized);
+				const finalContent = (hasBom ? "\uFEFF" : "") + restoreLineEndings(newNormalized, lineEnding);
 				await writeFile(absolutePath, finalContent, "utf-8");
 
 				if (signal?.aborted) throw new Error("Operation aborted");
