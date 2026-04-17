@@ -98,7 +98,7 @@ export class HashlineMismatchError extends Error {
 		const sorted = [...displayLines].sort((a, b) => a - b);
 		const out: string[] = [];
 		out.push(
-			`${mismatches.length} line${mismatches.length > 1 ? "s have" : " has"} changed since last read. ` +
+			`Edit failed: ${mismatches.length} line${mismatches.length > 1 ? "s have" : " has"} changed since last read. ` +
 				`Use the updated LINE#ID references shown below (>>> marks changed lines).`,
 		);
 		out.push("");
