@@ -348,6 +348,7 @@ export default function (pi: ExtensionAPI) {
 			"Edit a file using LINE#HASH anchors from read output. Supports multiple operations per call. " +
 			"Hashes are validated before any changes — stale references are rejected with updated anchors.",
 		promptSnippet: "Edit file using LINE#HASH anchors (replace, insert_after, insert_before)",
+		renderShell: "default",
 			promptGuidelines: [
 				"Always read a file before editing it to get current LINE#HASH anchors.",
 				"Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.",
