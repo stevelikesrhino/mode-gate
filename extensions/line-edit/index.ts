@@ -115,11 +115,9 @@ const editSchema = Type.Object({
 			pos: Type.String({
 				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Identifies which line to act on.',
 			}),
-			end: Type.Optional(
-				Type.String({
-					description: 'End anchor "LINE#HASH" for replace (inclusive). Required when op is "replace".',
-				}),
-			),
+			end: Type.String({
+				description: 'End anchor "LINE#HASH" for replace (inclusive).',
+			}),
 			content: Type.String({
 				description: "Replacement or insertion text. Use newlines for multiple lines. A trailing newline is preserved as a blank final line. Empty replacement deletes; empty insertion adds a blank line.",
 			}),
@@ -355,7 +353,7 @@ export default function (pi: ExtensionAPI) {
 				"Tool arguments must be a top-level object with path and edits. Put path at the top level, never inside edits[].",
 				"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
 				"Operations: replace (pos to end inclusive), insert_after, insert_before.",
-				"Use replace for single-line replacements by setting pos and end to the same anchor.",
+				"When using replace for single-line replacements, you MUST set pos to end to the same line anchor.",
 				"content is the replacement/insertion text. Use \\n for multiple lines. A trailing \\n is preserved as a blank final line. Empty replacement deletes lines; empty insertion adds a blank line.",
 				"Never include LINE#HASH: prefixes in content. content must contain plain file text only.",
 				"When editing code, prefer structurally complete edits. Do not replace only part of a function, class, loop, conditional, or try/catch block if that would leave duplicated, missing, or unbalanced lines.",
