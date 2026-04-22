@@ -502,10 +502,11 @@ export function generateEditDiff(
 
 			appendContextLines(output, oldDoc.lines, cursor, range.start - 1, lineNumWidth);
 
-			if (edit.op === "insert_before") {
-				appendAddedLines(output, edit.pos.line, edit.lines, lineNumWidth);
-				if (firstChangedLine === undefined) firstChangedLine = edit.pos.line;
-			} else {
+				if (edit.op === "insert_before") {
+					appendAddedLines(output, edit.pos.line, edit.lines, lineNumWidth);
+					cursor = edit.pos.line;
+					if (firstChangedLine === undefined) firstChangedLine = edit.pos.line;
+				} else {
 				appendRemovedLines(output, oldDoc.lines, edit.pos.line, edit.end.line, lineNumWidth);
 				appendAddedLines(output, edit.pos.line, edit.lines, lineNumWidth);
 				cursor = edit.end.line + 1;
