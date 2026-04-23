@@ -40,6 +40,8 @@ import {
 } from "./utils";
 
 const DEFAULT_GREP = "grep";
+const FULL_READ_THRESHOLD = 3;
+const COLLAPSED_DISPLAY_LINES = 10;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Edit preview computation (for renderCall)
@@ -261,7 +263,7 @@ export default function (pi: ExtensionAPI) {
 					if (truncated) {
 						const fullReadCount = (fullReadCountsByFile.get(absolutePath) ?? 0) + 1;
 						fullReadCountsByFile.set(absolutePath, fullReadCount);
-						if (fullReadCount >= 2) {
+						if (fullReadCount >= FULL_READ_THRESHOLD) {
 							grepNudgeToolCallIds.add(toolCallId);
 						}
 					}
@@ -299,7 +301,7 @@ export default function (pi: ExtensionAPI) {
 				.filter((line): line is string => line !== null);
 
 			// Truncate for display when collapsed
-			const maxLines = options.expanded ? contentLines.length : 10;
+		const maxLines = options.expanded ? contentLines.length : COLLAPSED_DISPLAY_LINES;
 			const displayLines = contentLines.slice(0, maxLines);
 
 			let output = displayLines.map((line) => theme.fg("toolOutput", line)).join("\n");

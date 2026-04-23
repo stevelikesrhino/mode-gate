@@ -1,4 +1,7 @@
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Constants ─────────────────────────────────────────────────────────────
+const MISMATCH_CONTEXT = 2;
+const MAX_LINES = 2000;
+const MAX_BYTES = 20 * 1024;
 // Pure-JS FNV-1a 32-bit hash (replaces Bun.hash.xxHash32)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -68,7 +71,6 @@ export interface HashMismatch {
 	actual: string;
 }
 
-const MISMATCH_CONTEXT = 2;
 
 export class HashlineMismatchError extends Error {
 	public readonly mismatches: HashMismatch[];
@@ -672,8 +674,6 @@ export function generateSimpleDiff(
 // Truncation (simplified from built-in)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_LINES = 2000;
-const MAX_BYTES = 20 * 1024;
 
 export function truncateContent(text: string): { content: string; truncated: boolean; totalLines: number; shownLines: number } {
 	const lines = text.split("\n");
