@@ -23,7 +23,7 @@ import {
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, Container } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { constants } from "fs";
+import { constants, readFileSync } from "fs";
 import { access, readFile, writeFile } from "fs/promises";
 import { resolve } from "path";
 
@@ -42,6 +42,10 @@ import {
 const DEFAULT_GREP = "grep";
 const FULL_READ_THRESHOLD = 3;
 const COLLAPSED_DISPLAY_LINES = 10;
+const EDIT_PROMPT_GUIDELINES = readFileSync(new URL("./edit-prompt.md", import.meta.url), "utf-8")
+	.split("\n")
+	.map((line) => line.trim())
+	.filter(Boolean);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Edit preview computation (for renderCall)
@@ -349,23 +353,7 @@ export default function (pi: ExtensionAPI) {
 			"Hashes are validated before any changes — stale references are rejected with updated anchors.",
 		promptSnippet: "Edit file using LINE#HASH anchors (replace, insert_after, insert_before)",
 		renderShell: "default",
-			promptGuidelines: [
-				"Always read a file before editing it to get current LINE#HASH anchors.",
-				"Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.",
-				"Tool arguments must be a top-level object with path and edits. Put path at the top level, never inside edits[].",
-				"Reference lines by their anchor from read output (e.g. pos: \"6#PM\").",
-				"Operations: replace (pos to end inclusive), insert_after, insert_before.",
-				"When using replace for single-line replacements, you MUST set pos to end to the same line anchor.",
-				"content is the replacement/insertion text. Use \\n for multiple lines. A trailing \\n is preserved as a blank final line. Empty replacement deletes lines; empty insertion adds a blank line.",
-				"Never include LINE#HASH: prefixes in content. content must contain plain file text only.",
-				"When editing code, prefer structurally complete edits. Do not replace only part of a function, class, loop, conditional, or try/catch block if that would leave duplicated, missing, or unbalanced lines.",
-				"Before submitting an edit, check that the result will not duplicate adjacent lines or drop required lines such as braces, return statements, or closing delimiters.",
-				"Example single-line replace: {\"path\":\"src/app.ts\",\"edits\":[{\"op\":\"replace\",\"pos\":\"6#PM\",\"end\":\"6#PM\",\"content\":\"const answer = 42;\"}]}",
-				"Example multi-line replace: {\"path\":\"src/app.ts\",\"edits\":[{\"op\":\"replace\",\"pos\":\"5#PM\",\"end\":\"9#NQ\",\"content\":\"if (ok) {\\n  return value;\\n}\"}]}",
-				"Example insert_after: {\"path\":\"src/app.ts\",\"edits\":[{\"op\":\"insert_after\",\"pos\":\"12#VR\",\"content\":\"console.log(answer);\"}]}",
-				"Example insert_before: {\"path\":\"src/app.ts\",\"edits\":[{\"op\":\"insert_before\",\"pos\":\"3#WS\",\"content\":\"import { foo } from \\\"./foo\\\";\"}]}",
-				"If hashes don't match (file changed), you'll get updated anchors — retry with those.",
-			],
+		promptGuidelines: EDIT_PROMPT_GUIDELINES,
 		parameters: editSchema,
 		prepareArguments: normalizeEditArguments,
 
