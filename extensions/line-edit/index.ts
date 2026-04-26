@@ -22,7 +22,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, Container } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { constants, readFileSync } from "fs";
 import { access, readFile, writeFile } from "fs/promises";
 import { resolve } from "path";

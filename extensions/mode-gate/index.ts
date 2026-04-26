@@ -12,7 +12,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
