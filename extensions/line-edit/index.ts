@@ -408,7 +408,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `Successfully edited ${path}.${warningText}`,
+								text: `Successfully edited ${path}.${warningText}\n\nSystemReminder: you MUST use ***read*** tool around the edited lines to verify the content.`,
 							},
 						],
 						details: { diff, firstChangedLine },
