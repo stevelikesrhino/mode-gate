@@ -122,7 +122,7 @@ const editSchema = Type.Object({
 				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Identifies which line to act on.',
 			}),
 			end: Type.String({
-				description: 'End anchor "LINE#HASH" for replace (inclusive).',
+				description: 'End anchor "LINE#HASH". Required by the schema for all operations. For replace, it is inclusive. For insert_after/insert_before, set it to the same anchor as pos.',
 			}),
 			content: Type.String({
 				description: "Replacement or insertion text. Use newlines for multiple lines. A trailing newline is preserved as a blank final line. Empty replacement deletes; empty insertion adds a blank line.",
