@@ -6,8 +6,8 @@
  * - yolo: no prompts, full access
  * - explore: read-only, no edit/write, bash allowlisted
  *
- * Shift+Tab cycles modes. /mode to pick or /mode <name> to switch directly.
- * Always starts in explore mode.
+ * Shift+Tab cycles available modes. /mode to pick or /mode <name> to switch directly.
+ * Starts in watched mode.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -17,9 +17,8 @@ import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
 
-const MODES: Mode[] = ["explore", "watched", "yolo"];
-
-const ALL_TOOLS = ["read", "read_image", "bash", "edit", "write", "grep", "find", "ls", "mode-guideline"];
+const DEFAULT_MODE: Mode = "watched";
+const AVAILABLE_MODES: Mode[] = ["watched", "yolo"];
 
 const MODE_LABELS: Record<Mode, string> = {
 	watched: "watched",
@@ -27,8 +26,13 @@ const MODE_LABELS: Record<Mode, string> = {
 	explore: "explore",
 };
 
+const MODE_DESCRIPTIONS: Record<Mode, string> = {
+	watched: "confirm edits & destructive bash",
+	yolo: "no prompts, full access",
+	explore: "read-only, safe bash only",
+};
 export default function modeGateExtension(pi: ExtensionAPI): void {
-	let currentMode: Mode = "explore";
+	let currentMode: Mode = DEFAULT_MODE;
 	let lastActiveMode: Mode | undefined = undefined;
 
 	// Per-tool-type "allow all this response" flags, reset on mode change and each turn
@@ -57,14 +61,13 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		if (currentMode === mode) return;
 		currentMode = mode;
 		resetAllowAll();
-		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
 		ctx.ui.notify(`Mode: ${MODE_LABELS[mode]}`);
 	}
 
 	function cycleMode(ctx: ExtensionContext): void {
-		const idx = MODES.indexOf(currentMode);
-		const next = MODES[(idx + 1) % MODES.length];
+		const idx = AVAILABLE_MODES.indexOf(currentMode);
+		const next = AVAILABLE_MODES[(idx + 1) % AVAILABLE_MODES.length];
 		setMode(next, ctx);
 	}
 
@@ -74,16 +77,12 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 
-			if (arg && MODES.includes(arg as Mode)) {
+			if (arg && AVAILABLE_MODES.includes(arg as Mode)) {
 				setMode(arg as Mode, ctx);
 				return;
 			}
 
-			const choice = await ctx.ui.select("Select mode:", [
-				"watched  —  confirm edits & destructive bash",
-				"yolo  —  no prompts, full access",
-				"explore  —  read-only, safe bash only",
-			]);
+			const choice = await ctx.ui.select("Select mode:", AVAILABLE_MODES.map((mode) => `${MODE_LABELS[mode]}  —  ${MODE_DESCRIPTIONS[mode]}`));
 
 			if (!choice) return;
 
@@ -255,6 +254,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
+
 		// watched mode: confirm edit, write, destructive bash
 		if (event.toolName === "edit") {
 			if (allowAll["edit"]) return undefined;
@@ -278,22 +278,19 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	// Always start in explore mode
+	// Always start in watched mode
 	pi.on("session_start", async (_event, ctx) => {
-		currentMode = "explore";
-		lastActiveMode = "explore";
+		currentMode = DEFAULT_MODE;
+		lastActiveMode = DEFAULT_MODE;
 		resetAllowAll();
-		pi.setActiveTools(ALL_TOOLS);
 		updateStatus(ctx);
 		// Register internal tool with mode descriptions in system prompt
 		pi.registerTool({
 			name: "mode-guideline",
 			label: "Mode Gate",
 			description: "This tool is NOT callable.\n"+
-			"- Mode: explore — you cannot write or edit or make file changes.\n"+
-			"- Mode: watched — edits, writes, and destructive bash commands require user approval.\n"+
-			"- Mode: yolo — full access with no prompts.\n"+
-			"- Default explore mode.\n",
+			AVAILABLE_MODES.map((mode) => `- Mode: ${MODE_LABELS[mode]} — ${MODE_DESCRIPTIONS[mode]}.`).join("\n")+"\n"+
+			`- Default ${MODE_LABELS[DEFAULT_MODE]} mode.\n`,
 			parameters: Type.Object({}),
 			async execute() {
 				throw new Error("mode_gate_internal should never be called");
