@@ -43,7 +43,7 @@ const DESTRUCTIVE_PATTERNS = [
 	/\bsystemctl\s+(start|stop|restart|enable|disable)/i,
 	/\bservice\s+\S+\s+(start|stop|restart)/i,
 	/\b(vim?|nano|emacs|code|subl)\b/i,
-	/\bsed\b(?!\s+-n)/i,
+	/\bsed\b(?=[^\n;&|]*\s(?:-[^\s-]*i[^\s]*|--in-place(?:=|\s|$)))/i,
 	/\bremove-item\b/i,
 	/\bset-content\b/i,
 	/\badd-content\b/i,
@@ -412,9 +412,21 @@ function isSafePmset(args: string[]): boolean {
 	return args[0] === "-g";
 }
 
-function isNullSink(target: string): boolean {
-	const normalizedTarget = target.trim().toLowerCase();
-	return normalizedTarget === "/dev/null" || normalizedTarget === "nul";
+function isSafeOutputTarget(target: string): boolean {
+	const normalizedTarget = target.trim().replace(/\\/g, "/").toLowerCase();
+
+	return normalizedTarget === "/dev/null"
+		|| normalizedTarget === "nul"
+		|| normalizedTarget === "nul:"
+		|| normalizedTarget.startsWith("/tmp/")
+		|| normalizedTarget.startsWith("/var/tmp/")
+		|| normalizedTarget.startsWith("/private/tmp/")
+		|| /^[a-z]:\/temp\//.test(normalizedTarget)
+		|| /^[a-z]:\/windows\/temp\//.test(normalizedTarget)
+		|| normalizedTarget.startsWith("%temp%/")
+		|| normalizedTarget.startsWith("%tmp%/")
+		|| normalizedTarget.startsWith("$env:temp/")
+		|| normalizedTarget.startsWith("$env:tmp/");
 }
 
 function isSafeSegment(segment: Segment): boolean {
@@ -438,7 +450,7 @@ function isSafeSegment(segment: Segment): boolean {
 	return segment.redirections.every((redirection) => {
 		if (redirection.kind === "dup") return DUP_REDIRECTION_TARGET_RE.test(redirection.target);
 		if (redirection.operator === "<") return true;
-		return isNullSink(redirection.target);
+		return isSafeOutputTarget(redirection.target);
 	});
 }
 
