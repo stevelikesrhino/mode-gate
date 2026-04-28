@@ -79,6 +79,10 @@
 ## 配置
 - **修改 grep 提示工具**：在 `extensions/line-edit/index.ts` 中修改 `DEFAULT_GREP` 常量，以更改提示 AI 使用的工具名称（例如将其改为 `rg`）。
 
+- **可选模式列表**：在 `extensions/mode-gate/index.ts` 中修改 `AVAILABLE_MODES`，以控制 `/mode` 选择器和 `Shift+Tab` 循环中出现的模式。
+  - 例如：`["watched", "yolo"]`
+  - 如需启用 explore：`["explore", "watched", "yolo"]`
+
 ## 安装
 
 1. 安装 PI Coding Agent：`npm install -g @mariozechner/pi-coding-agent`
@@ -182,6 +186,10 @@ The `skills/` folder contains personal workflow skills (init, load, save) for my
 
 ## Configuration
 - **Change grep nudge tool**: Modify the `DEFAULT_GREP` constant in `extensions/line-edit/index.ts` to change the tool name suggested to the AI in nudge messages (e.g., change it to `rg`).
+
+- **Available modes**: Modify `AVAILABLE_MODES` in `extensions/mode-gate/index.ts` to control which modes appear in the `/mode` picker and `Shift+Tab` cycle.
+  - Example: `["watched", "yolo"]`
+  - To enable explore: `["explore", "watched", "yolo"]`
 
 ## Install
 
