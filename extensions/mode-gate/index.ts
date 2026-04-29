@@ -270,6 +270,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 
 		if (event.toolName === "bash") {
 			const command = event.input.command as string;
+			if (isSafeCommand(command)) return undefined;
 			if (!isDestructiveCommand(command)) return undefined;
 			if (allowAll["bash"]) return undefined;
 			return handleWatchedConfirm("bash", `Bash: ${command}`, () => { allowAll["bash"] = true }, ctx);
