@@ -39,7 +39,7 @@ import {
 	truncateContent,
 } from "./utils";
 
-const DEFAULT_GREP = "grep";
+const DEFAULT_GREP = "rg";
 const FULL_READ_THRESHOLD = 3;
 const COLLAPSED_DISPLAY_LINES = 10;
 const EDIT_PROMPT_GUIDELINES = readFileSync(new URL("./edit-prompt.md", import.meta.url), "utf-8")
