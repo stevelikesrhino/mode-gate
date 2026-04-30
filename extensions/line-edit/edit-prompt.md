@@ -1,18 +1,3 @@
-- Always read a file before editing it to get current LINE#HASH anchors.
-- Read as many lines as you need before a large edit. Do NOT assume context from the lines that you didn't read.
-- Tool arguments must be a top-level object with path and edits. Put path at the top level, never inside edits[].
-- Reference lines by their anchor from read output (e.g. pos: "6#PM").
-- Operations: replace (pos to end, both lines included), insert_after, insert_before.
-- When using replace for single-line replacements, you MUST set pos to end to the same line anchor.
-- content is the replacement/insertion text. Use \n for multiple lines. A trailing \n is preserved as a blank final line. Empty replacement deletes lines; empty insertion adds a blank line.
-- Never include LINE#HASH: prefixes in content.
-- Make the minimum exact edit. Do not rewrite, reformat, or clean up unrelated code.
-- content must use matching indentation. If the file uses tabs, use real tabs.
-- Before submitting an edit, check that the result will not duplicate adjacent lines or drop required lines such as braces, return statements, or closing delimiters.
-- When replacement content ends with a closing delimiter like }, */, ), or ], verify end includes the original line carrying that delimiter.
-- When adding a sibling declaration or block, prefer insert_before on the next sibling so the new code lands in the intended scope.
-- If hashes don't match (file changed), you'll get updated anchors - retry with those.
-
 ## Example read output:
 ```
 1#VR:import { capitalize } from "./text";
@@ -51,4 +36,16 @@
 {"path":"src/app.ts","edits":[{"op":"replace","pos":"4#PM","end":"5#NQ","content":""}]}
 ```
 
-# Do not recalculate the hash. Use the LINE#HASH anchor exactly as read returned it.
+## Very important usage rules:
+- Do not recalculate the hash. Use the LINE#HASH anchor exactly as read returned it.
+- Always read a file before editing it to get current LINE#HASH anchors.
+- Tool arguments must be a top-level object with path and edits. Put path at the top level, never inside edits[].
+- Reference lines by their anchor from read output (e.g. pos: "6#PM").
+- Operations: replace (pos to end, both lines included), insert_after, insert_before.
+- When using replace for single-line replacements, you MUST set pos to end to the same line anchor.
+- Never include LINE#HASH: prefixes in content.
+- Make the minimum exact edit. Do not rewrite, reformat, or clean up unrelated code.
+- content must use matching indentation. If the file uses tabs, use real tabs.
+- Before submitting an edit, check that the result will not duplicate adjacent lines or drop required lines such as braces, return statements, or closing delimiters.
+- When replacement content ends with a closing delimiter like }, */, ), or ], verify end includes the original line carrying that delimiter.
+- When adding a sibling declaration or block, prefer insert_before on the next sibling so the new code lands in the intended scope.
