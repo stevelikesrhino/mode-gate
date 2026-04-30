@@ -122,10 +122,10 @@ const editSchema = Type.Object({
 				description: 'Line anchor "LINE#HASH" from read output (e.g. "5#PM"). Identifies which line to act on.',
 			}),
 			end: Type.String({
-				description: 'End anchor "LINE#HASH". Required by the schema for all operations. For replace, it is inclusive. For insert_after/insert_before, set it to the same anchor as pos.',
+				description: 'End anchor "LINE#HASH". Required by the schema for all operations. For replace, it is inclusive. For insert_after/insert_before, set it to the same anchor as pos. For insert operations, set end equal to pos.',
 			}),
 			content: Type.String({
-				description: "Replacement or insertion text. Use newlines for multiple lines. A trailing newline is preserved as a blank final line. Empty replacement deletes; empty insertion adds a blank line.",
+				description: "Replacement or insertion text. Raw file text only; no LINE#HASH prefixes. Use newlines for multiple lines. Use \\n only where actual new lines are intended. A trailing newline is preserved as a blank final line. Empty replacement deletes; empty insertion adds a blank line.",
 			}),
 		}),
 	),
@@ -350,7 +350,9 @@ export default function (pi: ExtensionAPI) {
 		label: "edit",
 		description:
 			"Edit a file using LINE#HASH anchors from read output. Supports multiple operations per call. " +
-			"Hashes are validated before any changes — stale references are rejected with updated anchors.",
+			"Hashes are validated before any changes — stale references are rejected with updated anchors. " +
+			"Always read first. Use exact LINE#HASH anchors. Never include anchors in content. " +
+			"Be careful with \\n; use it only for intended new lines.",
 		promptSnippet: "Edit file using LINE#HASH anchors (replace, insert_after, insert_before)",
 		renderShell: "default",
 		promptGuidelines: EDIT_PROMPT_GUIDELINES,
