@@ -19,13 +19,14 @@ import {
 	keyHint,
 	createReadToolDefinition,
 	defineTool,
+	getAgentDir,
 } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text, Container } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
-import { constants, readFileSync } from "fs";
+import { constants, existsSync, readFileSync } from "fs";
 import { access, readFile, writeFile } from "fs/promises";
-import { resolve } from "path";
+import { join, resolve } from "path";
 
 import {
 	formatLineTag,
@@ -39,13 +40,80 @@ import {
 	truncateContent,
 } from "./line-edit-utils.js";
 
-const DEFAULT_GREP = "rg";
-const FULL_READ_THRESHOLD = 3;
-const COLLAPSED_DISPLAY_LINES = 10;
+export interface ModeGateSettings {
+	readPreview: boolean;
+	exploreAvailable: boolean;
+	defaultGrep: string;
+	readMaxBytes: number;
+	readMaxLines: number;
+	fullReadNudgeThreshold: number;
+}
+
+const DEFAULT_MODE_GATE_SETTINGS: ModeGateSettings = {
+	readPreview: false,
+	exploreAvailable: false,
+	defaultGrep: "rg",
+	readMaxBytes: 20 * 1024,
+	readMaxLines: 2000,
+	fullReadNudgeThreshold: 3,
+};
 const EDIT_PROMPT_GUIDELINES = readFileSync(new URL("./edit-prompt.md", import.meta.url), "utf-8")
 	.split("\n")
 	.map((line) => line.trim())
 	.filter(Boolean);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readPositiveInteger(value: unknown, key: string, source: string): number {
+	if (!Number.isInteger(value) || (value as number) < 1) {
+		throw new Error(`Invalid modeGate.${key} in ${source}: expected a positive integer.`);
+	}
+	return value as number;
+}
+
+function readNonEmptyString(value: unknown, key: string, source: string): string {
+	if (typeof value !== "string" || value.trim() === "") {
+		throw new Error(`Invalid modeGate.${key} in ${source}: expected a non-empty string.`);
+	}
+	return value;
+}
+
+function readBoolean(value: unknown, key: string, source: string): boolean {
+	if (typeof value !== "boolean") {
+		throw new Error(`Invalid modeGate.${key} in ${source}: expected a boolean.`);
+	}
+	return value;
+}
+
+function loadModeGateSettingsFile(path: string): Partial<ModeGateSettings> {
+	if (!existsSync(path)) return {};
+
+	const parsed = JSON.parse(readFileSync(path, "utf-8"));
+	if (!isRecord(parsed) || parsed.modeGate === undefined) return {};
+	if (!isRecord(parsed.modeGate)) {
+		throw new Error(`Invalid modeGate settings in ${path}: expected an object.`);
+	}
+
+	const raw = parsed.modeGate;
+	const settings: Partial<ModeGateSettings> = {};
+	if (raw.readPreview !== undefined) settings.readPreview = readBoolean(raw.readPreview, "readPreview", path);
+	if (raw.exploreAvailable !== undefined) settings.exploreAvailable = readBoolean(raw.exploreAvailable, "exploreAvailable", path);
+	if (raw.defaultGrep !== undefined) settings.defaultGrep = readNonEmptyString(raw.defaultGrep, "defaultGrep", path);
+	if (raw.readMaxBytes !== undefined) settings.readMaxBytes = readPositiveInteger(raw.readMaxBytes, "readMaxBytes", path);
+	if (raw.readMaxLines !== undefined) settings.readMaxLines = readPositiveInteger(raw.readMaxLines, "readMaxLines", path);
+	if (raw.fullReadNudgeThreshold !== undefined) settings.fullReadNudgeThreshold = readPositiveInteger(raw.fullReadNudgeThreshold, "fullReadNudgeThreshold", path);
+	return settings;
+}
+
+export function loadModeGateSettings(cwd = process.cwd()): ModeGateSettings {
+	return {
+		...DEFAULT_MODE_GATE_SETTINGS,
+		...loadModeGateSettingsFile(join(getAgentDir(), "settings.json")),
+		...loadModeGateSettingsFile(join(cwd, ".pi", "settings.json")),
+	};
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Edit preview computation (for renderCall)
@@ -164,7 +232,14 @@ function normalizeEditArguments(input: unknown): unknown {
 const getSystemReadTool = (cwd?: string) => createReadToolDefinition(cwd ?? process.cwd());
 const systemReadTool = getSystemReadTool();
 
-export function registerLineEditTools(pi: ExtensionAPI): void {
+function stripHashlinePrefixes(text: string): string {
+	return text.split("\n").map((line) => {
+		const match = line.match(/^\d+#[ZPMQVRWSNKTXJBYH]{2}:(.*)$/);
+		return match ? match[1] : line;
+	}).join("\n");
+}
+
+export function registerLineEditTools(pi: ExtensionAPI, settings = loadModeGateSettings()): void {
 	const fullReadCountsByFile = new Map<string, number>();
 	const grepNudgeToolCallIds = new Set<string>();
 
@@ -263,11 +338,14 @@ export function registerLineEditTools(pi: ExtensionAPI): void {
 				.join("\n");
 
 				// Truncate if needed
-					const { content: truncContent, truncated, shownLines } = truncateContent(hashFormatted);
+					const { content: truncContent, truncated, shownLines } = truncateContent(hashFormatted, {
+						maxLines: settings.readMaxLines,
+						maxBytes: settings.readMaxBytes,
+					});
 					if (truncated) {
 						const fullReadCount = (fullReadCountsByFile.get(absolutePath) ?? 0) + 1;
 						fullReadCountsByFile.set(absolutePath, fullReadCount);
-						if (fullReadCount >= FULL_READ_THRESHOLD) {
+						if (fullReadCount >= settings.fullReadNudgeThreshold) {
 							grepNudgeToolCallIds.add(toolCallId);
 						}
 					}
@@ -291,37 +369,40 @@ export function registerLineEditTools(pi: ExtensionAPI): void {
 							details: { lines: totalLines, truncationNotice },
 						};
 					},
+		renderCall: systemReadTool.renderCall,
 		renderResult(result, options, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const rawContent = result.content[0]?.text ?? "";
+			const displayResult = {
+				...result,
+				content: result.content.map((part) => part.type === "text" ? { ...part, text: stripHashlinePrefixes(part.text) } : part),
+			};
 
-			// Strip LINE#HASH: prefixes for display
-			const lines = rawContent.split("\n");
-			const contentLines = lines
+			if (!settings.readPreview) {
+				return systemReadTool.renderResult?.(displayResult, options, theme, context) ?? new Container();
+			}
+
+			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			const rawContent = result.content[0]?.type === "text" ? result.content[0].text : "";
+			const contentLines = rawContent.split("\n")
 				.map((line) => {
 					const match = line.match(/^\d+#[ZPMQVRWSNKTXJBYH]{2}:(.*)$/);
 					return match ? match[1] : null;
 				})
 				.filter((line): line is string => line !== null);
-
-			// Truncate for display when collapsed
-		const maxLines = options.expanded ? contentLines.length : COLLAPSED_DISPLAY_LINES;
+			const maxLines = options.expanded ? contentLines.length : 10;
 			const displayLines = contentLines.slice(0, maxLines);
 
 			let output = displayLines.map((line) => theme.fg("toolOutput", line)).join("\n");
-
 			if (!options.expanded && contentLines.length > maxLines) {
 				output += `\n${theme.fg("muted", `... (${contentLines.length - maxLines} more lines)`)} ${keyHint("app.tools.expand", "to expand")}`;
 			}
 
-				// Show truncation notice from details
-				const truncationNotice = result.details?.truncationNotice;
-				if (truncationNotice) {
-					output += `\n${theme.fg("warning", truncationNotice)}`;
-				}
-				text.setText(output);
-				return text;
-			},
+			const truncationNotice = result.details?.truncationNotice;
+			if (truncationNotice) {
+				output += `\n${theme.fg("warning", truncationNotice)}`;
+			}
+			text.setText(output);
+			return text;
+		},
 		});
 
 		pi.on("tool_result", async (event) => {
@@ -331,7 +412,7 @@ export function registerLineEditTools(pi: ExtensionAPI): void {
 
 			pi.sendMessage({
 				customType: "line-edit",
-				content: `Use [${DEFAULT_GREP}] to narrow range before the next read.`,
+				content: `Use [${settings.defaultGrep}] to narrow range before the next read.`,
 				display: true,
 			}, {
 				deliverAs: "steer",

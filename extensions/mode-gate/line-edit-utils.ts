@@ -728,20 +728,30 @@ export function generateSimpleDiff(
 // ═══════════════════════════════════════════════════════════════════════════
 
 
-export function truncateContent(text: string): { content: string; truncated: boolean; totalLines: number; shownLines: number } {
+export interface TruncateContentOptions {
+	maxLines?: number;
+	maxBytes?: number;
+}
+
+export function truncateContent(
+	text: string,
+	options: TruncateContentOptions = {},
+): { content: string; truncated: boolean; totalLines: number; shownLines: number } {
+	const maxLines = options.maxLines ?? MAX_LINES;
+	const maxBytes = options.maxBytes ?? MAX_BYTES;
 	const lines = text.split("\n");
 	const totalLines = lines.length;
 	const totalBytes = Buffer.byteLength(text, "utf-8");
 
-	if (totalLines <= MAX_LINES && totalBytes <= MAX_BYTES) {
+	if (totalLines <= maxLines && totalBytes <= maxBytes) {
 		return { content: text, truncated: false, totalLines, shownLines: totalLines };
 	}
 
 	const out: string[] = [];
 	let bytes = 0;
-	for (let i = 0; i < lines.length && i < MAX_LINES; i++) {
+	for (let i = 0; i < lines.length && i < maxLines; i++) {
 		const lineBytes = Buffer.byteLength(lines[i], "utf-8") + (i > 0 ? 1 : 0);
-		if (bytes + lineBytes > MAX_BYTES) break;
+		if (bytes + lineBytes > maxBytes) break;
 		out.push(lines[i]);
 		bytes += lineBytes;
 	}

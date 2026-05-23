@@ -1,38 +1,124 @@
 # Mode Gate
 
-为 [PI Coding Agent](https://github.com/badlogic/pi-mono) 设计的三模式权限控制系统。
+为 [PI Coding Agent](https://github.com/badlogic/pi-mono) 设计的权限控制系统。
 
-A three-mode permission control system for [PI Coding Agent](https://github.com/badlogic/pi-mono).
-
-## 模式 / Modes
+## 模式
 
 | 模式 | 描述 |
 |------|------|
-| **explore** | 只读。仅允许安全命令。 |
 | **watched** | 每次编辑或破坏性操作前确认。（默认） |
+| **explore** | 只读。仅允许安全命令。（需开启 `exploreAvailable`） |
 | **yolo** | 无提示，完全访问。 |
 
-## 功能 / Features
+## 功能
 
 - **line-edit** — 基于 LINE#HASH 锚点的文件编辑，解决 CJK tokenizer 问题
 - **latex2md** — 将 LaTeX 输出转为可读 Markdown
 - **spinner-verbs** — 某C字头软件的功能
-- **自定义允许/拒绝** — watched 模式下可为决策添加follow up
+- **自定义允许/拒绝** — watched 模式下可为决策添加 follow up
 - **批量批准** — 一次性批准同类操作
-- **破坏性命令检测** — 拦截 rm, mv, sed, git push 等
+- **不可逆命令检测** — 拦截 rm, mv, sed, git push 等
 
-## 快速开始 / Quick Start
+## 快速开始
 
 - `Shift+Tab` — 循环切换模式
 - `/mode <name>` — 直接切换
 
-## 安装 / Install
+## 设置（可选）
+
+添加到 `settings.json`（全局）或 `.pi/settings.json`（项目）。只需配置想修改的部分：
+
+```json
+{
+  "modeGate": {
+    "readPreview": true,
+    "exploreAvailable": true,
+    "defaultGrep": "rg",
+    "readMaxBytes": 20480,
+    "readMaxLines": 2000,
+    "fullReadNudgeThreshold": 3
+  }
+}
+```
+
+| 设置项 | 默认值 | 说明 |
+|---|---|---|
+| `readPreview` | `false` | 在 TUI 中显示读取预览 |
+| `exploreAvailable` | `false` | 启用只读 explore 模式；开启后 Shift+Tab 顺序为 watched → explore → yolo |
+| `defaultGrep` | `"rg"` | 建议使用的 grep 工具 |
+| `readMaxBytes` | `20480` | hashline read 输出截断前的最大字节数 |
+| `readMaxLines` | `2000` | hashline read 输出截断前的最大行数 |
+| `fullReadNudgeThreshold` | `3` | 同一文件连续截断读取达到该次数后建议 grep |
+
+## 安装
 
 1. `npm install -g @mariozechner/pi-coding-agent`
-2. Clone this repo
+2. `git clone`
 3. `cd extensions/mode-gate && npm install`
-4. Copy `mode-gate` folder to your PI extensions directory
-5. Enable in settings
+4. 将 `mode-gate` 复制到 PI 的 extensions 目录（剩下的 extension 也可以玩玩～）
+5. 在 `settings.json` 中配置（可选）
+
+---
+
+# Mode Gate
+
+A permission control system for [PI Coding Agent](https://github.com/badlogic/pi-mono).
+
+## Modes
+
+| Mode | Description |
+|------|------|
+| **watched** | Confirm before each edit or destructive action. (default) |
+| **explore** | Read-only. Safe commands only. (requires `exploreAvailable`) |
+| **yolo** | No prompts, full access. |
+
+## Features
+
+- **line-edit** — LINE#HASH anchored file editing, solves CJK tokenizer issues
+- **latex2md** — Convert LaTeX output to readable Markdown
+- **spinner-verbs** — Spinner verb enhancements
+- **Custom allow/deny** — Add follow-ups to decisions in watched mode
+- **Batch approval** — Approve similar operations at once
+- **Destructive command detection** — Intercept rm, mv, sed, git push, etc.
+
+## Quick Start
+
+- `Shift+Tab` — Cycle through modes
+- `/mode <name>` — Switch directly
+
+## Settings (optional)
+
+Add to `settings.json` (global) or `.pi/settings.json` (project). You can configure only the settings you want to change:
+
+```json
+{
+  "modeGate": {
+    "readPreview": true,
+    "exploreAvailable": true,
+    "defaultGrep": "rg",
+    "readMaxBytes": 20480,
+    "readMaxLines": 2000,
+    "fullReadNudgeThreshold": 3
+  }
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `readPreview` | `false` | Show read preview in TUI |
+| `exploreAvailable` | `false` | Enable read-only explore mode; when enabled, Shift+Tab cycles watched → explore → yolo |
+| `defaultGrep` | `"rg"` | Grep tool to suggest |
+| `readMaxBytes` | `20480` | Max bytes before truncating hashline read output |
+| `readMaxLines` | `2000` | Max lines before truncating hashline read output |
+| `fullReadNudgeThreshold` | `3` | Truncated reads of the same file before suggesting grep |
+
+## Install
+
+1. `npm install -g @mariozechner/pi-coding-agent`
+2. `git clone`
+3. `cd extensions/mode-gate && npm install`
+4. Copy `mode-gate` to your PI extensions directory (feel free to try the other extensions too)
+5. Configure in `settings.json` (optional)
 
 ## License
 

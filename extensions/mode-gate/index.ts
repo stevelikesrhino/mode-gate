@@ -12,13 +12,12 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
-import { registerLineEditTools } from "./line-edit.js";
+import { loadModeGateSettings, registerLineEditTools } from "./line-edit.js";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
 
 const DEFAULT_MODE: Mode = "watched";
-const AVAILABLE_MODES: Mode[] = ["watched", "yolo"];
 
 const MODE_LABELS: Record<Mode, string> = {
 	watched: "watched",
@@ -31,6 +30,10 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
 	yolo: "no prompts, full access",
 	explore: "read-only, safe bash only",
 };
+
+function availableModes(exploreAvailable: boolean): Mode[] {
+	return exploreAvailable ? ["watched", "explore", "yolo"] : ["watched", "yolo"];
+}
 
 function isEditTool(toolName: string): boolean {
 	return toolName === "edit" || toolName === "line-edit";
@@ -54,7 +57,9 @@ function lineEditActiveTools(activeTools: string[]): string[] {
 }
 
 export default function modeGateExtension(pi: ExtensionAPI): void {
-	registerLineEditTools(pi);
+	const settings = loadModeGateSettings();
+	const modes = availableModes(settings.exploreAvailable);
+	registerLineEditTools(pi, settings);
 
 	let currentMode: Mode = DEFAULT_MODE;
 	let lastActiveMode: Mode | undefined = undefined;
@@ -90,23 +95,23 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	function cycleMode(ctx: ExtensionContext): void {
-		const idx = AVAILABLE_MODES.indexOf(currentMode);
-		const next = AVAILABLE_MODES[(idx + 1) % AVAILABLE_MODES.length];
+		const idx = modes.indexOf(currentMode);
+		const next = modes[(idx + 1) % modes.length];
 		setMode(next, ctx);
 	}
 
 	// /mode or /mode <name>
 	pi.registerCommand("mode", {
-		description: "Switch permission mode (watched / yolo / explore)",
+		description: `Switch permission mode (${modes.join(" / ")})`,
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
 
-			if (arg && AVAILABLE_MODES.includes(arg as Mode)) {
+			if (arg && modes.includes(arg as Mode)) {
 				setMode(arg as Mode, ctx);
 				return;
 			}
 
-			const choice = await ctx.ui.select("Select mode:", AVAILABLE_MODES.map((mode) => `${MODE_LABELS[mode]}  —  ${MODE_DESCRIPTIONS[mode]}`));
+			const choice = await ctx.ui.select("Select mode:", modes.map((mode) => `${MODE_LABELS[mode]}  —  ${MODE_DESCRIPTIONS[mode]}`));
 
 			if (!choice) return;
 
