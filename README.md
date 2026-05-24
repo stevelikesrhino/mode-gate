@@ -52,7 +52,7 @@
 
 ## 安装
 
-1. `npm install -g @mariozechner/pi-coding-agent`
+1. `npm install -g @earendil-works/pi-coding-agent`
 2. `git clone`
 3. `cd extensions/mode-gate && npm install`
 4. 将 `mode-gate` 复制到 PI 的 extensions 目录（剩下的 extension 也可以玩玩～）
@@ -114,7 +114,7 @@ Add to `settings.json` (global) or `.pi/settings.json` (project). You can config
 
 ## Install
 
-1. `npm install -g @mariozechner/pi-coding-agent`
+1. `npm install -g @earendil-works/pi-coding-agent`
 2. `git clone`
 3. `cd extensions/mode-gate && npm install`
 4. Copy `mode-gate` to your PI extensions directory (feel free to try the other extensions too)

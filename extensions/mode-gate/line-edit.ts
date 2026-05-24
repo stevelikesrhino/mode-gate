@@ -20,9 +20,9 @@ import {
 	createReadToolDefinition,
 	defineTool,
 	getAgentDir,
-} from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { Text, Container } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Text, Container } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { constants, existsSync, readFileSync } from "fs";
 import { access, readFile, writeFile } from "fs/promises";

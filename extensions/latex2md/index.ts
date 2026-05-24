@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { MATH_SYMBOL_REPLACEMENTS, replaceKnownLatexCommands } from "./utils";
 
 const MODEL_FILTER = ["gemma"];

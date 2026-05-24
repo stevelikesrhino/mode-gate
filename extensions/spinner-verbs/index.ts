@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Dynamic color in range 100-150
 let currentColor: [number, number, number] = [150, 130, 0];

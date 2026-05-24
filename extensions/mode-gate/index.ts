@@ -10,8 +10,8 @@
  * Starts in watched mode.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Input, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Input, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { loadModeGateSettings, registerLineEditTools } from "./line-edit.js";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
