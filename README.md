@@ -12,7 +12,7 @@
 
 ## 功能
 
-- **line-edit** — 基于 LINE#HASH 锚点的文件编辑，解决 CJK tokenizer 问题
+- **line-edit** *(Deprecated)* — 基于 LINE#HASH 锚点的文件编辑，解决 CJK tokenizer 问题（已移至 `line-edit` 分支）
 - **latex2md** — 将 LaTeX 输出转为可读 Markdown
 - **spinner-verbs** — 某C字头软件的功能
 - **自定义允许/拒绝** — watched 模式下可为决策添加 follow up
@@ -33,10 +33,10 @@
   "modeGate": {
     "readPreview": true,
     "exploreAvailable": true,
-    "defaultGrep": "rg",
-    "readMaxBytes": 20480,
-    "readMaxLines": 2000,
-    "fullReadNudgeThreshold": 3
+    "defaultGrep": "rg", 		// line-edit
+    "readMaxBytes": 20480, 		// line-edit
+    "readMaxLines": 2000, 		// line-edit
+    "fullReadNudgeThreshold": 3 // line-edit
   }
 }
 ```
@@ -45,10 +45,10 @@
 |---|---|---|
 | `readPreview` | `false` | 在 TUI 中显示读取预览 |
 | `exploreAvailable` | `false` | 启用只读 explore 模式；开启后 Shift+Tab 顺序为 watched → explore → yolo |
-| `defaultGrep` | `"rg"` | 建议使用的 grep 工具 |
-| `readMaxBytes` | `20480` | hashline read 输出截断前的最大字节数 |
-| `readMaxLines` | `2000` | hashline read 输出截断前的最大行数 |
-| `fullReadNudgeThreshold` | `3` | 同一文件连续截断读取达到该次数后建议 grep |
+| `defaultGrep` | `"rg"` | 建议使用的 grep 工具 (line-edit) |
+| `readMaxBytes` | `20480` | hashline read 输出截断前的最大字节数 (line-edit) |
+| `readMaxLines` | `2000` | hashline read 输出截断前的最大行数 (line-edit) |
+| `fullReadNudgeThreshold` | `3` | 同一文件连续截断读取达到该次数后建议 grep (line-edit) |
 
 ## 安装
 
@@ -74,7 +74,7 @@ A permission control system for [PI Coding Agent](https://github.com/badlogic/pi
 
 ## Features
 
-- **line-edit** — LINE#HASH anchored file editing, solves CJK tokenizer issues
+- **line-edit** *(Deprecated)* — LINE#HASH anchored file editing, solves CJK tokenizer issues (moved to `line-edit` branch)
 - **latex2md** — Convert LaTeX output to readable Markdown
 - **spinner-verbs** — Spinner verb enhancements
 - **Custom allow/deny** — Add follow-ups to decisions in watched mode
@@ -95,10 +95,10 @@ Add to `settings.json` (global) or `.pi/settings.json` (project). You can config
   "modeGate": {
     "readPreview": true,
     "exploreAvailable": true,
-    "defaultGrep": "rg",
-    "readMaxBytes": 20480,
-    "readMaxLines": 2000,
-    "fullReadNudgeThreshold": 3
+    "defaultGrep": "rg", 		// line-edit
+    "readMaxBytes": 20480, 		// line-edit
+    "readMaxLines": 2000, 		// line-edit
+    "fullReadNudgeThreshold": 3 // line-edit
   }
 }
 ```
@@ -107,10 +107,10 @@ Add to `settings.json` (global) or `.pi/settings.json` (project). You can config
 |---|---|---|
 | `readPreview` | `false` | Show read preview in TUI |
 | `exploreAvailable` | `false` | Enable read-only explore mode; when enabled, Shift+Tab cycles watched → explore → yolo |
-| `defaultGrep` | `"rg"` | Grep tool to suggest |
-| `readMaxBytes` | `20480` | Max bytes before truncating hashline read output |
-| `readMaxLines` | `2000` | Max lines before truncating hashline read output |
-| `fullReadNudgeThreshold` | `3` | Truncated reads of the same file before suggesting grep |
+| `defaultGrep` | `"rg"` | Grep tool to suggest (line-edit) |
+| `readMaxBytes` | `20480` | Max bytes before truncating hashline read output (line-edit) |
+| `readMaxLines` | `2000` | Max lines before truncating hashline read output (line-edit) |
+| `fullReadNudgeThreshold` | `3` | Truncated reads of the same file before suggesting grep (line-edit) |
 
 ## Install
 

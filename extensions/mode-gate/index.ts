@@ -10,9 +10,11 @@
  * Starts in watched mode.
  */
 
+import { createReadToolDefinition, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Input, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { loadModeGateSettings, registerLineEditTools } from "./line-edit.js";
+import { Input, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
@@ -31,35 +33,93 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
 	explore: "read-only, safe bash only",
 };
 
+interface ModeGateSettings {
+	exploreAvailable: boolean;
+	readPreview: boolean;
+}
+
+const DEFAULT_MODE_GATE_SETTINGS: ModeGateSettings = {
+	exploreAvailable: false,
+	readPreview: false,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readBoolean(value: unknown, key: string, source: string): boolean {
+	if (typeof value !== "boolean") {
+		throw new Error(`Invalid modeGate.${key} in ${source}: expected a boolean.`);
+	}
+	return value;
+}
+
+function loadModeGateSettingsFile(path: string): Partial<ModeGateSettings> {
+	if (!existsSync(path)) return {};
+
+	const parsed = JSON.parse(readFileSync(path, "utf-8"));
+	if (!isRecord(parsed) || parsed.modeGate === undefined) return {};
+	if (!isRecord(parsed.modeGate)) {
+		throw new Error(`Invalid modeGate settings in ${path}: expected an object.`);
+	}
+
+	const raw = parsed.modeGate;
+	const settings: Partial<ModeGateSettings> = {};
+	if (raw.exploreAvailable !== undefined) settings.exploreAvailable = readBoolean(raw.exploreAvailable, "exploreAvailable", path);
+	if (raw.readPreview !== undefined) settings.readPreview = readBoolean(raw.readPreview, "readPreview", path);
+	return settings;
+}
+
+function loadModeGateSettings(cwd = process.cwd()): ModeGateSettings {
+	return {
+		...DEFAULT_MODE_GATE_SETTINGS,
+		...loadModeGateSettingsFile(join(getAgentDir(), "settings.json")),
+		...loadModeGateSettingsFile(join(cwd, ".pi", "settings.json")),
+	};
+}
+
 function availableModes(exploreAvailable: boolean): Mode[] {
 	return exploreAvailable ? ["watched", "explore", "yolo"] : ["watched", "yolo"];
 }
 
-function isEditTool(toolName: string): boolean {
-	return toolName === "edit" || toolName === "line-edit";
+function registerReadPreview(pi: ExtensionAPI): void {
+	const systemReadTool = createReadToolDefinition(process.cwd());
+	pi.registerTool({
+		...systemReadTool,
+		renderResult(result, options, theme, context) {
+			if (options.expanded || context.isError) {
+				return systemReadTool.renderResult?.(result, options, theme, context) ?? new Text("", 0, 0);
+			}
+
+			const textParts = result.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text);
+			if (textParts.length === 0) {
+				return systemReadTool.renderResult?.(result, options, theme, context) ?? new Text("", 0, 0);
+			}
+
+			const lines = textParts.join("\n").split("\n");
+			const maxLines = 10;
+			const displayLines = lines.slice(0, maxLines);
+			const remaining = lines.length - displayLines.length;
+			let output = `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+
+			if (remaining > 0) {
+				output += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")})`;
+			}
+
+			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			text.setText(output);
+			return text;
+		},
+	});
 }
 
-function lineEditActiveTools(activeTools: string[]): string[] {
-	const next: string[] = [];
-
-	for (const toolName of activeTools) {
-		const replacement = toolName === "edit" ? "line-edit" : toolName;
-		if (!next.includes(replacement)) {
-			next.push(replacement);
-		}
-	}
-
-	if (next.includes("read") && !next.includes("read-image")) {
-		next.splice(next.indexOf("read") + 1, 0, "read-image");
-	}
-
-	return next;
-}
 
 export default function modeGateExtension(pi: ExtensionAPI): void {
 	const settings = loadModeGateSettings();
 	const modes = availableModes(settings.exploreAvailable);
-	registerLineEditTools(pi, settings);
+	if (settings.readPreview) registerReadPreview(pi);
 
 	let currentMode: Mode = DEFAULT_MODE;
 	let lastActiveMode: Mode | undefined = undefined;
@@ -271,7 +331,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 
 		// Explore: block edit/write and unsafe bash
 		if (currentMode === "explore") {
-			if (isEditTool(event.toolName) || event.toolName === "write") {
+			if (event.toolName === "edit" || event.toolName === "write") {
 				return { block: true, reason: EXPLORE_BLOCKED };
 			}
 			if (event.toolName === "bash") {
@@ -285,7 +345,7 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 
 
 		// watched mode: confirm edit, write, destructive bash
-		if (isEditTool(event.toolName)) {
+		if (event.toolName === "edit") {
 			if (allowAll["edit"]) return undefined;
 			const path = event.input.file_path as string || event.input.path as string || "unknown";
 			return handleWatchedConfirm("edit", `Edit: ${path}`, () => { allowAll["edit"] = true }, ctx);
@@ -313,7 +373,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		currentMode = DEFAULT_MODE;
 		lastActiveMode = DEFAULT_MODE;
 		resetAllowAll();
-		pi.setActiveTools(lineEditActiveTools(pi.getActiveTools()));
 		updateStatus(ctx);
 	});
 }
