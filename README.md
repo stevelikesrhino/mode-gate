@@ -14,7 +14,6 @@
 
 - **line-edit** *(Deprecated)* — 基于 LINE#HASH 锚点的文件编辑，解决 CJK tokenizer 问题（已移至 `line-edit` 分支）
 - **latex2md** — 将 LaTeX 输出转为可读 Markdown
-- **spinner-verbs** — 某C字头软件的功能
 - **自定义允许/拒绝** — watched 模式下可为决策添加 follow up
 - **批量批准** — 一次性批准同类操作
 - **不可逆命令检测** — 拦截 rm, mv, sed, git push 等
@@ -76,7 +75,6 @@ A permission control system for [PI Coding Agent](https://github.com/badlogic/pi
 
 - **line-edit** *(Deprecated)* — LINE#HASH anchored file editing, solves CJK tokenizer issues (moved to `line-edit` branch)
 - **latex2md** — Convert LaTeX output to readable Markdown
-- **spinner-verbs** — Spinner verb enhancements
 - **Custom allow/deny** — Add follow-ups to decisions in watched mode
 - **Batch approval** — Approve similar operations at once
 - **Destructive command detection** — Intercept rm, mv, sed, git push, etc.
