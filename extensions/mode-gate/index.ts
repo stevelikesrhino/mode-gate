@@ -10,9 +10,9 @@
  * Starts in watched mode.
  */
 
-import { createReadToolDefinition, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Input, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Input, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { isDestructiveCommand, isSafeCommand } from "./utils.js";
@@ -35,12 +35,10 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
 
 interface ModeGateSettings {
 	exploreAvailable: boolean;
-	readPreview: boolean;
 }
 
 const DEFAULT_MODE_GATE_SETTINGS: ModeGateSettings = {
 	exploreAvailable: false,
-	readPreview: false,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -66,7 +64,6 @@ function loadModeGateSettingsFile(path: string): Partial<ModeGateSettings> {
 	const raw = parsed.modeGate;
 	const settings: Partial<ModeGateSettings> = {};
 	if (raw.exploreAvailable !== undefined) settings.exploreAvailable = readBoolean(raw.exploreAvailable, "exploreAvailable", path);
-	if (raw.readPreview !== undefined) settings.readPreview = readBoolean(raw.readPreview, "readPreview", path);
 	return settings;
 }
 
@@ -82,44 +79,9 @@ function availableModes(exploreAvailable: boolean): Mode[] {
 	return exploreAvailable ? ["watched", "explore", "yolo"] : ["watched", "yolo"];
 }
 
-function registerReadPreview(pi: ExtensionAPI): void {
-	const systemReadTool = createReadToolDefinition(process.cwd());
-	pi.registerTool({
-		...systemReadTool,
-		renderResult(result, options, theme, context) {
-			if (options.expanded || context.isError) {
-				return systemReadTool.renderResult?.(result, options, theme, context) ?? new Text("", 0, 0);
-			}
-
-			const textParts = result.content
-				.filter((part) => part.type === "text")
-				.map((part) => part.text);
-			if (textParts.length === 0) {
-				return systemReadTool.renderResult?.(result, options, theme, context) ?? new Text("", 0, 0);
-			}
-
-			const lines = textParts.join("\n").split("\n");
-			const maxLines = 10;
-			const displayLines = lines.slice(0, maxLines);
-			const remaining = lines.length - displayLines.length;
-			let output = `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
-
-			if (remaining > 0) {
-				output += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")})`;
-			}
-
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(output);
-			return text;
-		},
-	});
-}
-
-
 export default function modeGateExtension(pi: ExtensionAPI): void {
 	const settings = loadModeGateSettings();
 	const modes = availableModes(settings.exploreAvailable);
-	if (settings.readPreview) registerReadPreview(pi);
 
 	let currentMode: Mode = DEFAULT_MODE;
 	let lastActiveMode: Mode | undefined = undefined;

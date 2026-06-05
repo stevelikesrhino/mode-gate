@@ -1,0 +1,10 @@
+{
+	"name": "pi-extension-my-read",
+	"version": "1.0.0",
+	"type": "module",
+	"omp": {
+		"extensions": [
+			"./index.ts"
+		]
+	}
+}
