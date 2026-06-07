@@ -117,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 		name: "fetch_content",
 		label: "Fetch Content",
 		description:
-			"Fetch a single HTTP(S) URL and extract readable page content as markdown. Supports ordinary HTML pages and plain text responses only; it does not analyze videos, clone repositories, extract PDFs, or run browser/Gemini fallbacks.",
+			"Fetch a single HTTP(S) URL and extract readable page content as markdown.",
 		promptSnippet:
 			"Use fetch_content to read the content of a specific web page URL returned by web_search or supplied by the user.",
 		parameters: Type.Object({
