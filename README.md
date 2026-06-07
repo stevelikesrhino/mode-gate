@@ -15,6 +15,7 @@
 - **line-edit** *(Deprecated)* — 基于 LINE#HASH 锚点的文件编辑，解决 CJK tokenizer 问题（已移至 `line-edit` 分支）
 - **latex2md** — 将 LaTeX 输出转为可读 Markdown
 - **my-read** — 读取输出添加文件行号，并在 TUI 中显示读取预览
+- **pi-web-access（精简）** — 从 [`nicobailon/pi-web-access`](https://github.com/nicobailon/pi-web-access) 精简为仅保留 `web_search` 与 `fetch_content`
 - **自定义允许/拒绝** — watched 模式下可为决策添加 follow up
 - **批量批准** — 一次性批准同类操作
 - **不可逆命令检测** — 拦截 rm, mv, sed, git push 等
@@ -67,6 +68,7 @@ A permission control system for [PI Coding Agent](https://github.com/badlogic/pi
 - **line-edit** *(Deprecated)* — LINE#HASH anchored file editing, solves CJK tokenizer issues (moved to `line-edit` branch)
 - **latex2md** — Convert LaTeX output to readable Markdown
 - **my-read** — Add file line numbers to read output and show a numbered TUI read preview
+- **pi-web-access (pruned)** — Trimmed from [`nicobailon/pi-web-access`](https://github.com/nicobailon/pi-web-access) to only `web_search` and `fetch_content`
 - **Custom allow/deny** — Add follow-ups to decisions in watched mode
 - **Batch approval** — Approve similar operations at once
 - **Destructive command detection** — Intercept rm, mv, sed, git push, etc.

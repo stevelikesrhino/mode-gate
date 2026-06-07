@@ -1,0 +1,39 @@
+{
+  "name": "@stevelikesrhino/pi-web-access-pruned",
+  "version": "0.1.0",
+  "description": "Pruned derivative of pi-web-access with only basic web search and URL content extraction",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "web-search",
+    "fetch",
+    "scraping"
+  ],
+  "author": "stevelikesrhino",
+  "contributors": [
+    "Nico Bailon"
+  ],
+  "license": "MIT",
+  "upstream": {
+    "name": "pi-web-access",
+    "author": "Nico Bailon",
+    "url": "https://github.com/nicobailon/pi-web-access",
+    "license": "MIT"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "linkedom": "^0.16.0",
+    "turndown": "^7.2.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
