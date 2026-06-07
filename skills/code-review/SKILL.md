@@ -15,6 +15,7 @@ Goal: Provide a concise, priority-driven code review to ensure quality, correctn
 2. **Analysis**:
     - Evaluate the code independently for logical correctness, performance, security, and project-specific conventions.
     - Focus on high-impact issues first.
+    - Do NOT assume dirty entries, previous faulty logic, etc. Assume previous code works properly.
     - Do not force-find issues if the code is already clean and correct.
 
 3. **Categorization**:
