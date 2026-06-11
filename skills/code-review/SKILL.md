@@ -13,19 +13,17 @@ Goal: Provide a concise, priority-driven code review to ensure quality, correctn
     - If no changes exist: Ask the user for the specific review target (e.g., file path, commit hash, or branch).
 
 2. **Analysis**:
-    - Evaluate the code independently for logical correctness, performance, security, and project-specific conventions.
-    - Focus on high-impact issues first.
-    - Do NOT assume dirty entries, previous faulty logic, etc. Assume previous code works properly.
-    - Do not force-find issues if the code is already clean and correct.
-
-3. **Categorization**:
-    - **P0 (Critical)**: Fatal bugs, security vulnerabilities, or crashes. (Must Fix)
-    - **P1 (High)**: Logic errors, significant performance issues, or major architectural violations. (Should Fix)
-    - **P2 (Medium)**: Code smells, missing edge case handling, or minor convention issues. (Suggested)
-    - **P3 (Low)**: Style improvements, naming suggestions, or minor nitpicks.
-    - **P4 (Trivial)**: Extremely minor nitpicks or trivial style issues.
-
-## Output Format
-- **Summary**: A brief overview of the changes.
-- **Findings**: Grouped by priority from P0 to P4.
-- If no issues are found across any priority level, reply "LGTM" with a brief summary instead.
+    - Trace ALL the code that's related to scope of changes.
+    - Find bugs. Don't hang up too much on "what if DB jitters" "what if network disconnects". If infra problem leads to very severe issues that's not fixable, point out.
+    - Assume the business logic is corret.
+    - Be thorough about your analysis. Think carefully. False positive is worse than no positive.
+    - Group by P0 to P4.
+| Priority | Classification          | Meaning                                                                                                                                    |
+| -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **P0**   | **Critical / Incident** | Production down, data loss/corruption, security breach, payments broken, or core flow blocked for most users. Requires immediate response. |
+| **P1**   | **High / Urgent**       | Major functionality broken for many users, but not total outage. Limited workaround may exist. Fix ASAP.                                   |
+| **P2**   | **Medium / Important**  | Noticeable bug affecting some users or a non-core workflow. Workaround usually exists. Prioritize in normal sprint/release.                |
+| **P3**   | **Low / Minor**         | Small bug, edge case, UI issue, copy problem, or low-impact behavior. Fix when convenient.                                                 |
+| **P4**   | **Trivial / Polish**    | Cosmetic nit, cleanup, inconsistency, or nice-to-have improvement. Backlog material.                                                       |
+ 
+    - If all good? Say LGTM.
