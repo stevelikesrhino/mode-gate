@@ -17,6 +17,7 @@ Goal: Provide a concise, priority-driven code review to ensure quality, correctn
     - Find bugs. Don't hang up too much on "what if DB jitters" "what if network disconnects". If infra problem leads to very severe issues that's not fixable, point out.
     - Assume the business logic is corret.
     - Be thorough about your analysis. Think carefully. False positive is worse than no positive.
+    - If you find edge cases or boundary conditions, verify them against actual data/code before raising issues.
     - Group by P0 to P4.
 | Priority | Classification          | Meaning                                                                                                                                    |
 | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -26,4 +27,6 @@ Goal: Provide a concise, priority-driven code review to ensure quality, correctn
 | **P3**   | **Low / Minor**         | Small bug, edge case, UI issue, copy problem, or low-impact behavior. Fix when convenient.                                                 |
 | **P4**   | **Trivial / Polish**    | Cosmetic nit, cleanup, inconsistency, or nice-to-have improvement. Backlog material.                                                       |
  
+    - **Evidence Requirement**: P2 and above must include code snippet as evidence (with file path and line number). No conclusions without code backing.
+
     - If all good? Say LGTM.
