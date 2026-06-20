@@ -16,6 +16,7 @@
 - **latex2md** — 将 LaTeX 输出转为可读 Markdown
 - **my-read** — 读取输出添加文件行号，并在 TUI 中显示读取预览
 - **pi-web-access（精简）** — 从 [`nicobailon/pi-web-access`](https://github.com/nicobailon/pi-web-access) 精简为仅保留 `web_search` 与 `fetch_content`
+- **handoff** — 通过 `HANDOFF.md` 跨 session 传递上下文：`/handoff` 生成检查点文件，`/handin` 以隐藏消息注入到下次对话前，重复调用按照最新的HANDOFF.md替换
 - **自定义允许/拒绝** — watched 模式下可为决策添加 follow up
 - **批量批准** — 一次性批准同类操作
 - **不可逆命令检测** — 拦截 rm, mv, sed, git push 等
@@ -69,6 +70,7 @@ A permission control system for [PI Coding Agent](https://github.com/badlogic/pi
 - **latex2md** — Convert LaTeX output to readable Markdown
 - **my-read** — Add file line numbers to read output and show a numbered TUI read preview
 - **pi-web-access (pruned)** — Trimmed from [`nicobailon/pi-web-access`](https://github.com/nicobailon/pi-web-access) to only `web_search` and `fetch_content`
+- **handoff** — Cross-session context transfer via `HANDOFF.md`: `/handoff` writes a checkpoint file, `/handin` injects it as a hidden message before the next user prompt, repeated calls replace via latest-wins
 - **Custom allow/deny** — Add follow-ups to decisions in watched mode
 - **Batch approval** — Approve similar operations at once
 - **Destructive command detection** — Intercept rm, mv, sed, git push, etc.
