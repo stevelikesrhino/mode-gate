@@ -84,7 +84,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	const modes = availableModes(settings.exploreAvailable);
 
 	let currentMode: Mode = DEFAULT_MODE;
-	let lastActiveMode: Mode | undefined = undefined;
 
 	// Per-tool-type "allow all this response" flags, reset on mode change and each turn
 	const allowAll: Record<string, boolean> = {};
@@ -94,9 +93,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	}
 
 	const EXPLORE_BLOCKED = "BLOCKED: you are in explore mode — only read-only tools and safe commands are permitted. Do NOT retry. Do NOT use bash to write/edit files. Describe what you would change instead, concisely.";
-	const EXPLORE_TEXT = "Runtime mode is now explore. Do not edit/write files; read-only tools and safe commands only.";
-	const WATCHED_TEXT = "Runtime mode is now watched. Edits/writes/destructive bash require user approval.";
-	const YOLO_TEXT = "Runtime mode is now yolo. Tool calls are not approval-gated by mode-gate.";
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (currentMode === "watched") {
@@ -150,21 +146,8 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	});
 
 	// Reset "allow_all" every turn
-	pi.on("before_agent_start", async (event, _ctx) => {
+	pi.on("before_agent_start", async (_event, _ctx) => {
 		resetAllowAll();
-		if (currentMode === lastActiveMode) return;
-		lastActiveMode = currentMode;
-
-		const content = currentMode === "explore" ? EXPLORE_TEXT :
-			currentMode === "watched" ? WATCHED_TEXT : YOLO_TEXT;
-
-		return {
-			message: {
-				customType: "system-reminder",
-				content,
-				display: false,
-			},
-		};
 	});
 
 	// Shared confirmation dialog with optional Tab-to-add-message
@@ -333,7 +316,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	// Always start in watched mode
 	pi.on("session_start", async (_event, ctx) => {
 		currentMode = DEFAULT_MODE;
-		lastActiveMode = DEFAULT_MODE;
 		resetAllowAll();
 		updateStatus(ctx);
 	});
