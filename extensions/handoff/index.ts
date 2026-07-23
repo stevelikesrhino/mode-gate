@@ -1,4 +1,11 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { complete, type Message, type Tool } from "@earendil-works/pi-ai";
+import {
+	convertToLlm,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	sessionEntryToContextMessages,
+} from "@earendil-works/pi-coding-agent";
+import { Loader } from "@earendil-works/pi-tui";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -33,7 +40,11 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, and error messages.
+
+Do not call tools. Output only the structured summary.`;
+
+const HANDOFF_WIDGET_KEY = "handoff-progress";
 
 type SessionEntry = ReturnType<ExtensionCommandContext["sessionManager"]["getEntries"]>[number];
 
@@ -44,12 +55,31 @@ type HandoffEntry = SessionEntry & {
 	parentId: string | null;
 };
 
-function sendUserMessage(pi: ExtensionAPI, ctx: { isIdle(): boolean }, message: string): void {
-	if (ctx.isIdle()) {
-		pi.sendUserMessage(message);
-		return;
-	}
-	pi.sendUserMessage(message, { deliverAs: "followUp" });
+function showPendingHandoff(ctx: ExtensionCommandContext): void {
+	if (ctx.mode !== "tui") return;
+	ctx.ui.setWidget(HANDOFF_WIDGET_KEY, [ctx.ui.theme.fg("muted", "Handoff pending...")]);
+}
+
+function showHandoffLoader(ctx: ExtensionCommandContext): void {
+	if (ctx.mode !== "tui") return;
+	ctx.ui.setWidget(HANDOFF_WIDGET_KEY, (tui, theme) => {
+		const loader = new Loader(
+			tui,
+			(frame) => theme.fg("accent", frame),
+			(message) => theme.fg("muted", message),
+			"Handing off...",
+		);
+		return {
+			render: (width: number) => loader.render(width).slice(1),
+			invalidate: () => loader.invalidate(),
+			dispose: () => loader.stop(),
+		};
+	});
+}
+
+function clearHandoffStatus(ctx: ExtensionCommandContext): void {
+	if (ctx.mode !== "tui") return;
+	ctx.ui.setWidget(HANDOFF_WIDGET_KEY, undefined);
 }
 
 function isHandoffEntry(entry: SessionEntry | undefined): entry is HandoffEntry {
@@ -99,16 +129,82 @@ async function pruneOrphanHandoffLeaves(sessionFile: string, activeBranchIds: Se
 
 export default function handoffExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("handoff", {
-		description: "Write HANDOFF.md using pi's compaction prompt",
+		description: "Write HANDOFF.md without changing the conversation",
 		handler: async (_args, ctx) => {
-			const handoffPath = join(ctx.cwd, "HANDOFF.md");
-			sendUserMessage(
-				pi,
-				ctx,
-				`Write a handoff file at ${handoffPath} using the current conversation context. Do not check whether HANDOFF.md exists. Do not ask for permission to overwrite it. Just write or overwrite it. Use this exact compaction prompt as the instructions for the file content:
+			if (!ctx.model) {
+				ctx.ui.notify("No model selected", "error");
+				return;
+			}
 
-${COMPACTION_PROMPT}`,
-			);
+			const wasIdle = ctx.isIdle();
+			if (!wasIdle) showPendingHandoff(ctx);
+
+			try {
+				if (!wasIdle) await ctx.waitForIdle();
+				showHandoffLoader(ctx);
+
+				const model = ctx.model!;
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				if (!auth.ok) throw new Error(auth.error);
+
+				const agentMessages = ctx.sessionManager
+					.buildContextEntries()
+					.flatMap(sessionEntryToContextMessages);
+				if (agentMessages.length === 0) {
+					ctx.ui.notify("No conversation to hand off", "warning");
+					return;
+				}
+
+				const activeToolNames = pi.getActiveTools();
+				const toolsByName = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+				const tools: Tool[] = activeToolNames.map((name) => {
+					const tool = toolsByName.get(name)!;
+					return { name: tool.name, description: tool.description, parameters: tool.parameters };
+				});
+				const handoffInstruction: Message = {
+					role: "user",
+					content: [{ type: "text", text: COMPACTION_PROMPT }],
+					timestamp: Date.now(),
+				};
+				const thinkingLevel = pi.getThinkingLevel();
+				const response = await complete(
+					model,
+					{
+						systemPrompt: ctx.getSystemPrompt(),
+						messages: [...convertToLlm(agentMessages), handoffInstruction],
+						tools,
+					},
+					{
+						apiKey: auth.apiKey,
+						headers: auth.headers,
+						env: auth.env,
+						maxTokens: 8192,
+						reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
+						sessionId: ctx.sessionManager.getSessionId(),
+					},
+				);
+				if (response.stopReason === "error") {
+					throw new Error(response.errorMessage ?? "Handoff summarization failed");
+				}
+
+				const summary = response.content
+					.filter((part): part is { type: "text"; text: string } => part.type === "text")
+					.map((part) => part.text)
+					.join("\n")
+					.trim();
+				if (!summary) throw new Error("Handoff summarization returned no text");
+
+				const handoffPath = join(ctx.cwd, "HANDOFF.md");
+				const tempPath = `${handoffPath}.handoff-${process.pid}-${Date.now()}.tmp`;
+				await writeFile(tempPath, `${summary}\n`, "utf-8");
+				await rename(tempPath, handoffPath);
+				ctx.ui.notify("HANDOFF.md created", "info");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Could not write HANDOFF.md: ${message}`, "error");
+			} finally {
+				clearHandoffStatus(ctx);
+			}
 		},
 	});
 
