@@ -41,7 +41,7 @@ function addLineNumbers(text: string, startLine: number): string {
 	const { body, suffix } = splitCoreReadNotice(text);
 	if (!shouldNumberText(body)) return text;
 
-	const lines = body.split("\n");
+	const lines = body.replace(/\r/g, "").split("\n");
 	const width = String(startLine + lines.length - 1).length;
 	const numbered = lines
 		.map((line, index) => `${String(startLine + index).padStart(width, " ")} | ${line}`)
