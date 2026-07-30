@@ -49,11 +49,13 @@ function parseExaMcpEnvelope(body: string): ExaMcpRpcResponse | null {
 }
 
 async function callExaMcp(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+	const apiKey = process.env.EXA_API_KEY?.trim();
 	const response = await fetch(EXA_MCP_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
 			"Accept": "application/json, text/event-stream",
+			...(apiKey ? { "Authorization": `Bearer ${apiKey}` } : {}),
 		},
 		body: JSON.stringify({
 			jsonrpc: "2.0",
