@@ -1,5 +1,6 @@
 import {
 	getAgentDir,
+	getLatestCompactionEntry,
 	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -9,6 +10,7 @@ const RESUME_MESSAGE = "Compaction interrupted the tool loop. Continue the origi
 
 export default function forcedCompactExtension(pi: ExtensionAPI): void {
 	let pendingCompaction = false;
+	let pendingCompactionAt: number | undefined;
 	let settingsManager: SettingsManager | undefined;
 
 	function getSettingsManager(ctx: ExtensionContext): SettingsManager {
@@ -20,6 +22,7 @@ export default function forcedCompactExtension(pi: ExtensionAPI): void {
 
 	function resumeToolLoop(): void {
 		pendingCompaction = false;
+		pendingCompactionAt = undefined;
 		pi.sendMessage(
 			{
 				customType: "forced-compact-resume",
@@ -71,12 +74,23 @@ export default function forcedCompactExtension(pi: ExtensionAPI): void {
 		}
 
 		pendingCompaction = true;
+		pendingCompactionAt = Date.now();
 		ctx.abort();
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!pendingCompaction) {
 			return;
+		}
+
+		// The core's built-in auto-compaction runs on agent_end, before this event.
+		// If it already compacted since we flagged this turn, don't compact again.
+		if (pendingCompactionAt !== undefined) {
+			const latest = getLatestCompactionEntry(ctx.sessionManager.getBranch());
+			if (latest && new Date(latest.timestamp).getTime() >= pendingCompactionAt) {
+				resumeToolLoop();
+				return;
+			}
 		}
 
 		pi.sendMessage({
