@@ -15,7 +15,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Input, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { isDestructiveCommand, isSafeCommand } from "./utils.js";
+import { isDestructiveCommand, isMuxCommand, isSafeCommand } from "./utils.js";
 
 type Mode = "watched" | "yolo" | "explore";
 
@@ -305,7 +305,9 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 		if (event.toolName === "bash") {
 			const command = event.input.command as string;
 			if (isSafeCommand(command)) return undefined;
-			if (!isDestructiveCommand(command)) return undefined;
+
+			// Unsafe mux controls use the Bash confirmation and allowance.
+			if (!isMuxCommand(command) && !isDestructiveCommand(command)) return undefined;
 			if (allowAll["bash"]) return undefined;
 			return handleWatchedConfirm("bash", `Bash: ${command}`, () => { allowAll["bash"] = true }, ctx);
 		}

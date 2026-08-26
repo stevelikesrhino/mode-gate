@@ -138,6 +138,44 @@ const SIMPLE_SAFE_COMMANDS = new Set([
 ]);
 
 const SHELL_SEPARATORS = new Set(["|", "&&", "||", ";"]);
+const MUX_EXECUTABLES = new Set(["tmux", "tmux.exe", "psmux", "psmux.exe", "pmux", "pmux.exe"]);
+const SAFE_MUX_COMMANDS = new Set([
+	"dump-state",
+	"has-session",
+	"info",
+	"list-buffers",
+	"list-clients",
+	"list-commands",
+	"list-keys",
+	"list-panes",
+	"list-sessions",
+	"list-windows",
+	"server-info",
+	"show-buffer",
+	"show-environment",
+	"show-hooks",
+	"show-messages",
+	"show-options",
+	"show-window-options",
+]);
+const MUX_COMMAND_ALIASES: Record<string, string> = {
+	capturep: "capture-pane",
+	display: "display-message",
+	dump: "dump-state",
+	has: "has-session",
+	ls: "list-sessions",
+	lsb: "list-buffers",
+	lsc: "list-clients",
+	lscm: "list-commands",
+	lsk: "list-keys",
+	lsp: "list-panes",
+	lsw: "list-windows",
+	show: "show-options",
+	showb: "show-buffer",
+	showenv: "show-environment",
+	showmsgs: "show-messages",
+	showw: "show-window-options",
+};
 const GIT_BRANCH_UNSAFE_FLAGS = new Set(["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"]);
 const GIT_BRANCH_SAFE_FLAGS = new Set(["-a", "-r", "-v", "-vv", "--all", "--remotes", "--verbose", "--show-current", "--list", "--contains", "--no-contains", "--merged", "--no-merged"]);
 const CURL_OUTPUT_FLAG_RE = /^-[^-\s]*[oO][^-\s]*$/;
@@ -412,6 +450,101 @@ function isSafePmset(args: string[]): boolean {
 	return args[0] === "-g";
 }
 
+function muxExecutableName(command: string): string {
+	return command.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+}
+
+function isMuxExecutable(command: string): boolean {
+	return MUX_EXECUTABLES.has(muxExecutableName(command));
+}
+
+function hasUnsafeMuxArgument(args: string[]): boolean {
+	return args.some((arg) => arg.includes("#(") || arg.includes(";"));
+}
+
+function parseMuxGlobalArgs(args: string[]): string[] | undefined {
+	let index = 0;
+
+	while (index < args.length) {
+		const arg = args[index];
+		if (arg === "-L" || arg === "-S" || arg === "-t") {
+			if (index + 1 >= args.length) return undefined;
+			index += 2;
+			continue;
+		}
+		if ((arg.startsWith("-L") || arg.startsWith("-S") || arg.startsWith("-t")) && arg.length > 2) {
+			index++;
+			continue;
+		}
+		break;
+	}
+
+	return args.slice(index);
+}
+
+function parseMuxShortArgs(
+	args: string[],
+	booleanFlags: string,
+	valueFlags: Set<string>,
+): { flags: Set<string>; positionals: string[] } | undefined {
+	const flags = new Set<string>();
+	const positionals: string[] = [];
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--") {
+			positionals.push(...args.slice(index + 1));
+			break;
+		}
+		if (!/^-[^-]/.test(arg)) {
+			positionals.push(arg);
+			continue;
+		}
+
+		const cluster = arg.slice(1);
+		for (let flagIndex = 0; flagIndex < cluster.length; flagIndex++) {
+			const flag = cluster[flagIndex];
+			if (valueFlags.has(`-${flag}`)) {
+				flags.add(flag);
+				if (flagIndex === cluster.length - 1) {
+					if (index + 1 >= args.length) return undefined;
+					index++;
+				}
+				break;
+			}
+			if (!booleanFlags.includes(flag)) return undefined;
+			flags.add(flag);
+		}
+	}
+
+	return { flags, positionals };
+}
+
+function isSafeMuxCapturePane(args: string[]): boolean {
+	const parsed = parseMuxShortArgs(args, "aCeFHJLMNpPqT", new Set(["-b", "-E", "-S", "-t"]));
+	return !!parsed && parsed.flags.has("p") && parsed.positionals.length === 0;
+}
+
+function isSafeMuxDisplayMessage(args: string[]): boolean {
+	const parsed = parseMuxShortArgs(args, "alpv", new Set(["-F", "-t"]));
+	return !!parsed && parsed.flags.has("p") && parsed.positionals.length <= 1;
+}
+
+function isSafeMux(args: string[]): boolean {
+	if (hasUnsafeMuxArgument(args)) return false;
+
+	const commandArgs = parseMuxGlobalArgs(args);
+	if (!commandArgs || commandArgs.length === 0) return false;
+	if (commandArgs.length === 1 && (commandArgs[0] === "-V" || commandArgs[0] === "--version")) return true;
+
+	const [rawSubcommand, ...subcommandArgs] = commandArgs;
+	const subcommand = MUX_COMMAND_ALIASES[rawSubcommand] ?? rawSubcommand;
+	if (SAFE_MUX_COMMANDS.has(subcommand)) return true;
+	if (subcommand === "capture-pane") return isSafeMuxCapturePane(subcommandArgs);
+	if (subcommand === "display-message") return isSafeMuxDisplayMessage(subcommandArgs);
+	return false;
+}
+
 function isSafeOutputTarget(target: string): boolean {
 	const normalizedTarget = target.trim().replace(/\\/g, "/").toLowerCase();
 
@@ -435,6 +568,7 @@ function isSafeSegment(segment: Segment): boolean {
 	const commandName = command.toLowerCase();
 
 	const readsOnly = SIMPLE_SAFE_COMMANDS.has(commandName)
+		|| (isMuxExecutable(command) && isSafeMux(args))
 		|| (commandName === "git" && isSafeGit(args))
 		|| (commandName === "npm" && isSafeNpm(args))
 		|| (commandName === "yarn" && isSafeYarn(args))
@@ -458,6 +592,12 @@ export function isSafeCommand(command: string): boolean {
 	if (containsUnsafeExpansion(command)) return false;
 	const segments = parseSegments(command);
 	return !!segments && segments.every((segment) => isSafeSegment(segment));
+}
+
+export function isMuxCommand(command: string): boolean {
+	const segments = parseSegments(command);
+	if (segments?.some((segment) => segment.argv.some(isMuxExecutable))) return true;
+	return /\b(?:tmux|psmux|pmux)(?:\.exe)?\b/i.test(command);
 }
 
 export function isDestructiveCommand(command: string): boolean {
