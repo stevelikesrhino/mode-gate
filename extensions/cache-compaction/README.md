@@ -1,20 +1,17 @@
-# Cache compaction
+# Codex native compaction
 
-One pi extension for two compaction paths:
+This extension provides remote opaque checkpoints for Codex. The `cache-compaction` directory name is retained so existing extension settings keep working.
 
 | Model/provider | Compaction | Failure behavior |
 | --- | --- | --- |
 | `openai-codex` with `openai-codex-responses` | Codex remote opaque checkpoint | Cancel; preserve existing history |
-| Other providers using `openai-completions` or `anthropic-messages` | Cache-aligned text summary | Return control to pi's native compaction |
-| `openai`, unsupported APIs | Pi native compaction | Unchanged |
+| All other providers and API shapes | Pi native compaction | Unchanged |
 
-The standard `openai` provider is deliberately excluded from the text path. Upstream Codex compaction does not support its API-key Responses endpoint.
+The standard `openai` provider uses pi's native compaction. Upstream Codex compaction does not support its API-key Responses endpoint.
 
 ## Behavior
 
-Pi owns manual, threshold, overflow, and between-turn compaction timing on pi 0.84.4 and later. Neither path registers tree-navigation or branch-summary handlers.
-
-The text path preserves pi's `firstKeptEntryId`, including `keepRecentTokens` and split-turn cut selection. It summarizes the history and turn prefix together in one request. Captured provider message content is reused without changing tool selection. If truncation removes an Anthropic conversation cache breakpoint, its TTL and cache policy move to the last eligible retained block. SDK-only beta/profile parameters are translated into HTTP headers; OAuth and Copilot credentials use bearer authentication. Unknown wire mappings or divergent history fall back to native compaction. Cache reads depend on the provider's serialization, cache availability, and breakpoints; they are not guaranteed for every supported API shape.
+Pi owns manual, threshold, overflow, and between-turn compaction timing on pi 0.84.4 and later. The extension registers no tree-navigation or branch-summary handlers. Non-Codex compaction uses pi's native summarizer without an extension request.
 
 The Codex path preserves upstream's opaque checkpoint format and replay rules, so sessions created by the npm extension remain readable. Its remote replacement history has its own recent-user-message retention policy, distinct from the text path's retained tail. It fails closed if a checkpoint is malformed or belongs to another Codex model. Switching providers cannot translate opaque history into text; only surviving pi messages remain available to other providers. Local Codex checkpoint markers are filtered from live context.
 
@@ -24,20 +21,17 @@ For older pi releases, the vendored Codex adapter retains upstream's legacy guar
 
 Load only `extensions/cache-compaction/index.ts`. Do not also load `npm:@ogulcancelik/pi-codex-compaction`, or both copies will register hooks.
 
-The migration removes the npm source from `settings.json` while leaving its installed files untouched. Existing processes need `/reload` or a restart. The text path needs a subsequent live provider request to populate capture; compaction immediately after reload may use native fallback.
-
-Set `CC_DEBUG_LOG=/path/to/log.jsonl` before startup to enable text-path diagnostics. Logging is off by default. Request bodies and authentication headers are not logged.
+The npm source was removed from `settings.json` while its installed files were left untouched. Existing processes need `/reload` or a restart to stop using the removed cache-aligned text path. Previously saved text summaries remain usable by pi.
 
 ## Tests
 
 From `~/.pi/agent`:
 
 ```sh
-node extensions/cache-compaction/tests/text-compaction.mjs
 node extensions/cache-compaction/tests/combined.mjs
 ```
 
-Both suites stub network calls. Set `PI_ROOT` if pi is installed somewhere other than `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent`.
+The suite stubs network calls. Set `PI_ROOT` if pi is installed somewhere other than `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent`.
 
 ## Attribution and license
 

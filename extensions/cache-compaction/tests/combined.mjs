@@ -86,7 +86,7 @@ assert.deepEqual(captured.payload, originalPayload, "no checkpoint means ordinar
 assert.match(captured.headers["x-codex-beta-features"], /remote_compaction_v2/);
 respond = sse;
 let result = await compact();
-assert.equal(calls.length, 1, "Codex cannot fall through to text compaction");
+assert.equal(calls.length, 1, "one Codex remote compaction request");
 assert.equal(calls[0].url, "https://proxy.example/codex/responses", "auth baseUrl override honored");
 assert.deepEqual(calls[0].body.input.at(-1), { type: "compaction_trigger" });
 assert.equal(calls[0].body.reasoning.effort, "low");
@@ -124,11 +124,11 @@ await capture(originalPayload);
 respond = () => new Response("bad request", { status: 400 });
 const beforeHttpFailure = calls.length;
 assert.deepEqual(await compact(), { cancel: true });
-assert.equal(calls.length, beforeHttpFailure + 1, "Codex error cancels without text fallback or permanent-error retry");
+assert.equal(calls.length, beforeHttpFailure + 1, "Codex error cancels without native fallback or permanent-error retry");
 respond = () => new Response('data: {"type":"response.failed"}\n\n');
 assert.deepEqual(await compact(), { cancel: true }, "failed SSE never creates a checkpoint");
 
-// Regular providers keep text compaction and ordinary branch-summary context.
+// Regular providers use pi's native compaction and keep branch-summary context.
 const regularCtx = { ...ctx, model: { ...model, provider: "deepseek", api: "openai-completions", id: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com" } };
 const branchSummary = { role: "branchSummary", summary: "Regular native branch summary", fromId: "other", timestamp: 5 };
 assert.deepEqual(await context([branchSummary, user], regularCtx), [branchSummary, user]);
@@ -140,17 +140,14 @@ const chat = { model: regularCtx.model.id, messages: [{ role: "system", content:
 captured = await capture(chat, regularCtx);
 assert.deepEqual(captured.payload, chat);
 assert.equal(captured.headers["x-codex-beta-features"], undefined);
-respond = () => Response.json({ choices: [{ message: { content: "## Goal\nRemember the migration token." }, finish_reason: "stop" }], usage: { prompt_tokens: 1000, prompt_cache_hit_tokens: 950, completion_tokens: 20 } });
 const beforeRegular = calls.length;
-result = await handlers.session_before_compact[0](compactEvent(), regularCtx);
-assert.equal(calls.length, beforeRegular + 1);
-assert.equal(result.compaction.details.kind, "cache-aligned-compaction");
-assert.equal(result.compaction.usage.cacheRead, 950);
-assert.equal(result.compaction.firstKeptEntryId, prep.firstKeptEntryId);
-assert.equal(calls.at(-1).body.tool_choice, undefined);
-assert.equal(calls.at(-1).body.input, undefined);
-respond = () => new Response("bad request", { status: 400 });
-assert.equal(await handlers.session_before_compact[0](compactEvent(), regularCtx), undefined, "text failures still fall back to native");
+const beforeRegularAuth = authCalls;
+for (const api of ["openai-completions", "anthropic-messages", "openai-responses"]) {
+	result = await handlers.session_before_compact[0](compactEvent(), { ...regularCtx, model: { ...regularCtx.model, api } });
+	assert.equal(result, undefined, `${api} compaction stays native`);
+}
+assert.equal(calls.length, beforeRegular, "non-Codex compaction makes no extension requests");
+assert.equal(authCalls, beforeRegularAuth, "non-Codex compaction does not resolve extension auth");
 
 const beforeExcluded = calls.length;
 const beforeAuth = authCalls;
@@ -173,6 +170,6 @@ assert.equal(calls.length, beforeMalformed, "malformed persisted checkpoint canc
 branch = regularBranch;
 const missingAuth = { ...ctx, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: false, error: "no key" }) } };
 assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), missingAuth), { cancel: true });
-assert.equal(calls.length, beforeMalformed, "Codex auth failure cannot fall through to text");
+assert.equal(calls.length, beforeMalformed, "Codex auth failure cannot fall through to native compaction");
 assert.equal(native.findNativeCheckpoint([{ ...checkpoint, details: { ...checkpoint.details, replacementHistory: [] } }]).status, "invalid");
-console.log("Combined dispatcher, Codex replay/failure, provider isolation, and branch-summary tests passed.");
+console.log("Codex compaction, replay/failure, provider isolation, and branch-summary tests passed.");
