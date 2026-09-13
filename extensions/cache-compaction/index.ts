@@ -1,10 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCodexCompaction } from "./codex/extension.ts";
 import { isOpenAICodexModel } from "./codex/native-compaction.ts";
+import registerTextCompaction from "./text-compaction.ts";
 
-/** Codex remote compaction; all other summarization remains pi's responsibility. */
+/** One owner for compaction; branch summarization remains pi's responsibility. */
 export default function cacheCompaction(pi: ExtensionAPI): void {
+	// Register Codex first so its persisted local marker is removed before
+	// text-mode context observation after a provider switch.
 	const compactCodex = registerCodexCompaction(pi);
+	const compactText = registerTextCompaction(pi);
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (isOpenAICodexModel(ctx.model)) {
@@ -15,6 +19,7 @@ export default function cacheCompaction(pi: ExtensionAPI): void {
 				return { cancel: true };
 			}
 		}
-		return undefined;
+		// The text path excludes openai and unsupported Codex API shapes.
+		return compactText(event, ctx);
 	});
 }
