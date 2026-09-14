@@ -10,9 +10,9 @@
  * Starts in watched mode.
  */
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { FooterComponent, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Input, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Input, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { isDestructiveCommand, isMuxCommand, isSafeCommand } from "./utils.js";
@@ -31,6 +31,12 @@ const MODE_DESCRIPTIONS: Record<Mode, string> = {
 	watched: "confirm edits & destructive bash",
 	yolo: "no prompts, full access",
 	explore: "read-only, safe bash only",
+};
+
+const MODE_COLORS: Record<Mode, "accent" | "warning" | "success"> = {
+	watched: "accent",
+	yolo: "warning",
+	explore: "success",
 };
 
 interface ModeGateSettings {
@@ -94,21 +100,68 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 
 	const EXPLORE_BLOCKED = "BLOCKED: you are in explore mode — only read-only tools and safe commands are permitted. Do NOT retry. Do NOT use bash to write/edit files. Describe what you would change instead, concisely.";
 
-	function updateStatus(ctx: ExtensionContext): void {
-		if (currentMode === "watched") {
-			ctx.ui.setStatus("mode-gate", ctx.ui.theme.fg("accent", `mode: ${MODE_LABELS[currentMode]}`));
-		} else if (currentMode === "yolo") {
-			ctx.ui.setStatus("mode-gate", ctx.ui.theme.fg("warning", `mode: ${MODE_LABELS[currentMode]}`));
-		} else {
-			ctx.ui.setStatus("mode-gate", ctx.ui.theme.fg("success", `mode: ${MODE_LABELS[currentMode]}`));
-		}
+	// The built-in footer renders extension statuses on their own line, so the mode is
+	// drawn by a custom footer instead: it wraps the built-in one and right-aligns the
+	// mode on its first line (cwd + branch), leaving the remaining lines untouched.
+	let activeCtx: ExtensionContext | undefined;
+	let requestRender: (() => void) | undefined;
+
+	function installFooter(ctx: ExtensionContext): void {
+		activeCtx = ctx;
+		if (ctx.mode !== "tui") return;
+
+		ctx.ui.setFooter((tui, theme, footerData) => {
+			requestRender = () => tui.requestRender();
+
+			// FooterComponent reads only these four members off the agent session.
+			const session = {
+				get state() {
+					return { model: activeCtx?.model, thinkingLevel: activeCtx?.thinkingLevel };
+				},
+				get sessionManager() {
+					return activeCtx?.sessionManager;
+				},
+				getContextUsage: () => activeCtx?.getContextUsage(),
+				get modelRuntime() {
+					// ModelRegistry is a facade over ModelRuntime; the footer needs the runtime
+					// itself for the subscription flag behind the cost figure.
+					const runtime = (activeCtx?.modelRegistry as unknown as { runtime?: unknown } | undefined)?.runtime;
+					return runtime ?? { isUsingSubscription: () => false };
+				},
+			};
+			const inner = new FooterComponent(session as never, footerData);
+			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+
+			return {
+				dispose() {
+					unsubscribe();
+					inner.dispose();
+				},
+				invalidate() {
+					inner.invalidate();
+				},
+				render(width: number): string[] {
+					const lines = inner.render(width);
+					const mode = theme.fg(MODE_COLORS[currentMode], `mode: ${MODE_LABELS[currentMode]}`);
+					const modeWidth = visibleWidth(mode);
+					let left = lines[0] ?? "";
+					const available = Math.max(0, width - modeWidth - 1);
+					if (visibleWidth(left) > available) {
+						left = truncateToWidth(left, available, theme.fg("dim", "..."));
+					}
+					const padding = " ".repeat(Math.max(1, width - visibleWidth(left) - modeWidth));
+					// Guard the case where the mode alone is wider than the terminal.
+					return [truncateToWidth(left + padding + mode, width), ...lines.slice(1)];
+				},
+			};
+		});
 	}
 
 	function setMode(mode: Mode, ctx: ExtensionContext): void {
 		if (currentMode === mode) return;
 		currentMode = mode;
 		resetAllowAll();
-		updateStatus(ctx);
+		requestRender?.();
 		ctx.ui.notify(`Mode: ${MODE_LABELS[mode]}`);
 	}
 
@@ -319,6 +372,6 @@ export default function modeGateExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		currentMode = DEFAULT_MODE;
 		resetAllowAll();
-		updateStatus(ctx);
+		installFooter(ctx);
 	});
 }
