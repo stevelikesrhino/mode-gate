@@ -1,12 +1,15 @@
-import { createHash } from "node:crypto";
-import { lstat, mkdir } from "node:fs/promises";
-import { createConnection, createServer, type Socket } from "node:net";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { link, lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createConnection, createServer, type AddressInfo, type Socket } from "node:net";
 import { join } from "node:path";
+import { privateWindowsDirectory } from "./windows.ts";
+
+const WINDOWS = process.platform === "win32";
 
 export const MAX_TEXT_BYTES = 16 * 1024;
-const MAX_FRAME_BYTES = 128 * 1024;
+const MAX_FRAME_BYTES = (WINDOWS ? 192 : 128) * 1024;
 const TIMEOUT_MS = 3000;
-export const AGENT_ID = /^[a-f0-9]{32}$/;
+export const AGENT_ID = /^[a-f0-9]{8}$/;
 
 export type AgentInfo = {
 	id: string;
@@ -23,11 +26,13 @@ export type Receipt = { status: "accepted" | "rejected" | "unknown"; reason?: st
 export type Response = { status: "ok"; agent: AgentInfo } | Receipt;
 
 export function socketDirectory(agentDir: string): string {
+	if (WINDOWS) return join(agentDir, "agent-text", "sockets");
 	const profile = createHash("sha256").update(agentDir).digest("hex").slice(0, 12);
 	return `/tmp/pi-agent-text-${process.getuid!()}-${profile}`;
 }
 
 export async function privateDirectory(path: string): Promise<void> {
+	if (WINDOWS) return privateWindowsDirectory(path);
 	await mkdir(path, { recursive: true, mode: 0o700 });
 	const stat = await lstat(path);
 	if (!stat.isDirectory() || stat.uid !== process.getuid!() || (stat.mode & 0o077) !== 0) {
@@ -35,7 +40,16 @@ export async function privateDirectory(path: string): Promise<void> {
 	}
 }
 
-function readFrame(socket: Socket, receive: (value: unknown) => void): void {
+function frame(value: unknown, key?: Buffer): string {
+	const text = JSON.stringify(value);
+	if (!key) return text + "\n";
+	const nonce = randomBytes(12);
+	const cipher = createCipheriv("aes-256-gcm", key, nonce);
+	const data = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+	return JSON.stringify(Buffer.concat([nonce, cipher.getAuthTag(), data]).toString("base64")) + "\n";
+}
+
+function readFrame(socket: Socket, receive: (value: unknown) => void, key?: Buffer): void {
 	let buffer = "";
 	let bytes = 0;
 	let finished = false;
@@ -54,6 +68,13 @@ function readFrame(socket: Socket, receive: (value: unknown) => void): void {
 		let value: unknown;
 		try {
 			value = JSON.parse(buffer.slice(0, end));
+			if (key) {
+				if (typeof value !== "string") throw new Error("Unauthenticated frame");
+				const data = Buffer.from(value, "base64");
+				const decipher = createDecipheriv("aes-256-gcm", key, data.subarray(0, 12));
+				decipher.setAuthTag(data.subarray(12, 28));
+				value = JSON.parse(Buffer.concat([decipher.update(data.subarray(28)), decipher.final()]).toString("utf8"));
+			}
 		} catch {
 			socket.destroy(new Error("Invalid agent text frame"));
 			return;
@@ -63,6 +84,7 @@ function readFrame(socket: Socket, receive: (value: unknown) => void): void {
 }
 
 export async function listen(path: string, receive: (value: unknown) => Response): Promise<() => Promise<void>> {
+	const key = WINDOWS ? randomBytes(32) : undefined;
 	const sockets = new Set<Socket>();
 	const server = createServer((socket) => {
 		sockets.add(socket);
@@ -76,29 +98,65 @@ export async function listen(path: string, receive: (value: unknown) => Response
 			} catch (error) {
 				response = { status: "rejected", reason: error instanceof Error ? error.message : String(error) };
 			}
-			socket.end(JSON.stringify(response) + "\n");
-		});
+			socket.end(frame(response, key));
+		}, key);
 	});
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
-		server.listen(path, () => {
+		server.listen(WINDOWS ? { host: "127.0.0.1", port: 0 } : { path }, () => {
 			server.off("error", reject);
 			resolve();
 		});
 	});
-	server.unref();
-	return () => new Promise<void>((resolve, reject) => {
+	const close = () => new Promise<void>((resolve, reject) => {
 		for (const socket of sockets) socket.destroy();
 		server.close((error) => error ? reject(error) : resolve());
 	});
+	if (key) {
+		const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+		try {
+			await writeFile(temporary, JSON.stringify({ port: (server.address() as AddressInfo).port, key: key.toString("hex") }), { flag: "wx" });
+			await link(temporary, path);
+			await rm(temporary);
+		} catch (error) {
+			await close();
+			await rm(temporary, { force: true });
+			throw error;
+		}
+	}
+	server.unref();
+	return async () => {
+		try {
+			await close();
+		} finally {
+			if (WINDOWS) await rm(path, { force: true });
+		}
+	};
 }
 
-export function request(directory: string, id: string, message: Request, signal?: AbortSignal): Promise<Response> {
-	if (!AGENT_ID.test(id)) return Promise.resolve({ status: "rejected", reason: "Invalid agent ID; use list_agent." });
+export async function request(directory: string, id: string, message: Request, signal?: AbortSignal): Promise<Response> {
+	if (!AGENT_ID.test(id)) return { status: "rejected", reason: "Invalid agent ID; use list_agent." };
+	const path = join(directory, `${id}.sock`);
+	let key: Buffer | undefined;
+	let port = 0;
+	if (WINDOWS) {
+		try {
+			const record = JSON.parse(await readFile(path, "utf8"));
+			if (!Number.isInteger(record.port) || record.port < 1 || record.port > 65535
+				|| typeof record.key !== "string" || !/^[a-f0-9]{64}$/.test(record.key)) {
+				throw new Error("Invalid agent registration");
+			}
+			port = record.port;
+			key = Buffer.from(record.key, "hex");
+		} catch (error) {
+			return { status: "rejected", reason: `Unavailable: ${(error as NodeJS.ErrnoException).code ?? String(error)} (offline, stopped, or stale ID).` };
+		}
+	}
+	if (signal?.aborted) return { status: "rejected", reason: "Cancelled before sending." };
 	return new Promise((resolve) => {
 		let sent = false;
 		let finished = false;
-		const socket = createConnection(join(directory, `${id}.sock`));
+		const socket = createConnection(WINDOWS ? { host: "127.0.0.1", port } : { path });
 		const finish = (response: Response) => {
 			if (finished) return;
 			finished = true;
@@ -124,11 +182,11 @@ export function request(directory: string, id: string, message: Request, signal?
 				return;
 			}
 			finish(response);
-		});
+		}, key);
 		socket.once("connect", () => {
 			if (finished) return;
 			sent = true;
-			socket.write(JSON.stringify(message) + "\n");
+			socket.write(frame(message, key));
 		});
 		signal?.addEventListener("abort", abort, { once: true });
 		if (signal?.aborted) abort();

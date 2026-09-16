@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,7 +9,7 @@ import { showAgents } from "./agent-list.ts";
 import { AGENT_ID, MAX_TEXT_BYTES, listen, privateDirectory, request, socketDirectory, type AgentInfo, type Receipt, type Response } from "./ipc.ts";
 
 export default function agentText(pi: ExtensionAPI): void {
-	const id = randomUUID().replaceAll("-", "");
+	const id = randomBytes(4).toString("hex");
 	let ctx: ExtensionContext;
 	let directory = "";
 	let preference = "";
