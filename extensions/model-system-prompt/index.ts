@@ -7,6 +7,7 @@ import {
 	getAgentDir,
 	type BuildSystemPromptOptions,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
 type Mapping = { "SYSTEM.md"?: string; "APPEND_SYSTEM.md"?: string };
@@ -50,6 +51,16 @@ function matches(pattern: string, model: string): boolean {
 	return new RegExp(`^${regex}$`).test(model);
 }
 
+function getRule(ctx: ExtensionContext): Rule | undefined {
+	if (!ctx.model) return;
+	const globalRules = loadRules(join(getAgentDir(), "settings.json"));
+	const projectRules = ctx.isProjectTrusted()
+		? loadRules(join(ctx.cwd, CONFIG_DIR_NAME, "settings.json"))
+		: [];
+	const id = `${ctx.model.provider}/${ctx.model.id}`;
+	return [...projectRules, ...globalRules].find((entry) => matches(entry.pattern, id));
+}
+
 function readPrompt(path: string, baseDir: string): string {
 	const expanded = path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
 	return readFileSync(resolve(baseDir, expanded), "utf8");
@@ -74,15 +85,21 @@ function contextSuffix(options: BuildSystemPromptOptions): string {
 }
 
 export default function modelSystemPrompt(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", (event, ctx) => {
-		if (!ctx.model) return;
+	pi.on("session_start", (event, ctx) => {
+		if (event.reason !== "startup" || ctx.mode !== "tui") return;
 		try {
-			const globalRules = loadRules(join(getAgentDir(), "settings.json"));
-			const projectRules = ctx.isProjectTrusted()
-				? loadRules(join(ctx.cwd, CONFIG_DIR_NAME, "settings.json"))
-				: [];
-			const id = `${ctx.model.provider}/${ctx.model.id}`;
-			const rule = [...projectRules, ...globalRules].find((entry) => matches(entry.pattern, id));
+			const rule = getRule(ctx);
+			if (!rule) return;
+			const mappings = Object.entries(rule.files).map(([section, path]) => `${section} → ${path}`);
+			ctx.ui.notify(`Prompt override: ${mappings.join(", ")}`, "info");
+		} catch (error) {
+			ctx.ui.notify(`model-system-prompt: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	});
+
+	pi.on("before_agent_start", (event, ctx) => {
+		try {
+			const rule = getRule(ctx);
 			if (!rule) return;
 
 			const options = event.systemPromptOptions;
