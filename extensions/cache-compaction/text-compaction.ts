@@ -17,13 +17,14 @@
  * - Only openai-completions and anthropic-messages payload shapes are handled;
  *   anything else falls back to pi's native compaction.
  *
- * Safety: any mismatch (no captured payload, model changed, cut point outside
- * the captured payload, tool calls in the response, truncated generation,
- * request failure) returns undefined, which makes pi run its native
- * compaction instead. A failed attempt can still add latency and cost.
+ * Limit failures retry with doubled recent-history retention and a shorter
+ * cached prefix. Other failures or exhausted retries yield to native compaction.
+ * Saved history and persistent settings are unchanged until a summary succeeds.
+ * Failed attempts can still add latency and cost.
  */
 
-import { convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, findCutPoint, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { isContextOverflow, type Usage } from "@earendil-works/pi-ai";
 import fs from "node:fs";
 
 // Opt-in diagnostics; request bodies and authentication headers are not logged.
@@ -119,6 +120,89 @@ const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response 
 const REQUEST_TIMEOUT_MS = 300_000;
 const RETRY_DELAY_MS = 2_000;
 const MAX_ATTEMPTS = 2;
+const MAX_LIMIT_RETRIES = 4;
+
+class CompactionLimitError extends Error {
+	constructor(message: string, readonly usage?: Usage) {
+		super(message);
+	}
+}
+
+function isContextLimitError(status: number, text: string, model: NonNullable<ExtensionContext["model"]>): boolean {
+	if (status !== 400 && status !== 413 && status !== 422) return false;
+	let message = text;
+	try {
+		const data: unknown = JSON.parse(text);
+		const error = isJsonObject(data) ? data.error ?? data : data;
+		// Exclude echoed request data; pi-ai owns all provider-specific matching.
+		message = isJsonObject(error)
+			? [error.message, error.code, error.type].filter((value) => typeof value === "string").join("\n")
+			: typeof error === "string" ? error : "";
+	} catch {
+		// Some compatible endpoints return plain-text errors.
+	}
+	return isContextOverflow({
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		stopReason: "error",
+		errorMessage: message.trim() || `${status} (no body)`,
+		usage: {
+			input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		timestamp: Date.now(),
+	});
+}
+
+function prepareRetry(event: SessionBeforeCompactEvent, keepRecentTokens: number): SessionBeforeCompactEvent["preparation"] | undefined {
+	const entries = event.branchEntries;
+	const previousIndex = entries.findLastIndex((entry) => entry.type === "compaction");
+	const previous = entries[previousIndex];
+	const keptIndex = previous?.type === "compaction" ? entries.findIndex((entry) => entry.id === previous.firstKeptEntryId) : -1;
+	const start = keptIndex >= 0 ? keptIndex : previousIndex + 1;
+	// prepareCompaction is not exported by pi; use its public cut selector and
+	// entry conversion, preserving the original summary and token accounting.
+	const cut = findCutPoint(entries, start, entries.length, keepRecentTokens);
+	const firstKeptEntryId = entries[cut.firstKeptEntryIndex]?.id;
+	if (!firstKeptEntryId) return undefined;
+	const messages = (from: number, to: number) => entries.slice(from, to).flatMap((entry) => {
+		if (entry.type === "compaction") return [];
+		return sessionEntryToContextMessages(entry).filter((message) => message.role !== "system");
+	});
+	const messagesToSummarize = messages(start, cut.isSplitTurn ? cut.turnStartIndex : cut.firstKeptEntryIndex);
+	const turnPrefixMessages = cut.isSplitTurn ? messages(cut.turnStartIndex, cut.firstKeptEntryIndex) : [];
+	if (!messagesToSummarize.length && !turnPrefixMessages.length) return undefined;
+	return {
+		...event.preparation,
+		firstKeptEntryId,
+		messagesToSummarize,
+		turnPrefixMessages,
+		isSplitTurn: cut.isSplitTurn,
+		settings: { ...event.preparation.settings, keepRecentTokens },
+	};
+}
+
+function addUsage(total: Usage | undefined, next: Usage | undefined): Usage | undefined {
+	if (!total) return next;
+	if (!next) return total;
+	return {
+		input: total.input + next.input,
+		output: total.output + next.output,
+		cacheRead: total.cacheRead + next.cacheRead,
+		cacheWrite: total.cacheWrite + next.cacheWrite,
+		totalTokens: total.totalTokens + next.totalTokens,
+		cost: {
+			input: total.cost.input + next.cost.input,
+			output: total.cost.output + next.cost.output,
+			cacheRead: total.cost.cacheRead + next.cost.cacheRead,
+			cacheWrite: total.cost.cacheWrite + next.cost.cacheWrite,
+			total: total.cost.total + next.cost.total,
+		},
+	};
+}
 
 type JsonObject = Record<string, any>;
 
@@ -211,10 +295,11 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
-async function postJson(url: string, body: JsonObject, headers: Record<string, string>, signal: AbortSignal): Promise<JsonObject> {
+async function postJson(url: string, body: JsonObject, headers: Record<string, string>, signal: AbortSignal, model: NonNullable<ExtensionContext["model"]>): Promise<JsonObject> {
 	let lastError: unknown;
 	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 		if (attempt > 0) await delay(RETRY_DELAY_MS, signal);
+		signal.throwIfAborted();
 		let res: Response;
 		try {
 			res = await fetch(url, {
@@ -223,7 +308,11 @@ async function postJson(url: string, body: JsonObject, headers: Record<string, s
 				body: JSON.stringify(body),
 				signal,
 			});
-			if (res.ok) return (await res.json()) as JsonObject;
+			if (res.ok) {
+				const data = await res.json();
+				signal.throwIfAborted();
+				return data as JsonObject;
+			}
 		} catch (err) {
 			if (signal.aborted) throw err;
 			lastError = err;
@@ -231,7 +320,10 @@ async function postJson(url: string, body: JsonObject, headers: Record<string, s
 		}
 		const status = res.status;
 		const text = await res.text().catch(() => "");
-		lastError = new Error(`HTTP ${status}: ${text.slice(0, 300)}`);
+		signal.throwIfAborted();
+		const error = new Error(`HTTP ${status}: ${text.slice(0, 300)}`);
+		lastError = error;
+		if (isContextLimitError(status, text, model)) throw new CompactionLimitError(error.message);
 		if (status !== 429 && status < 500) throw lastError;
 	}
 	throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -411,8 +503,9 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		capturedBySession.delete(ctx.sessionManager.getSessionId());
 	});
 
-	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+	const attempt = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
 		try {
+			event.signal?.throwIfAborted();
 			const model = ctx.model;
 			if (!model) return undefined;
 			// Decline before auth, preparation, or requests so other compaction
@@ -456,7 +549,11 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 
 			// Match pi's known error/abort omissions in temporary views only.
 			// Saved history, the captured payload, and the retained boundary stay intact.
-			const capturedCtx = captured.contextMessages?.filter((message) => !isOmittedAssistant(message));
+			// Newer pi versions include prompt-state messages in the transcript.
+			// Native preparation omits them; their wire representation stays intact.
+			const capturedCtx = captured.contextMessages?.filter((message) =>
+				!isOmittedAssistant(message) && !(isJsonObject(message) && message.role === "system"),
+			);
 			if (!capturedCtx) {
 				log({ ev: "fallback", stage: "no-context-capture" });
 				return undefined;
@@ -503,10 +600,8 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			delete body.stream_options;
 			// The live request's output cap may have been clamped to one token.
 			// Budget this shorter summary independently of the captured output cap.
-			// TODO: Bound output by the full summary request's remaining context space.
-			// Retention and reserve settings do not guarantee room after an overflow.
-			// Oversized prefixes need bounded/chunked summarization; oversized or noisy
-			// retained messages need a separate pruning policy. Native fallback may not fit.
+			// On a limit failure, doubling retention shortens this prefix and raises
+			// its output allowance. The provider still enforces its context ceiling.
 			const summaryTokens = Math.max(8192, prep.settings.keepRecentTokens, prep.settings.reserveTokens);
 			// Preserve explicit Anthropic thinking settings and their output allowance.
 			const thinkingTokens = isAnthropic && body.thinking?.type === "enabled" ? body.thinking.budget_tokens : 0;
@@ -578,23 +673,16 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				setHeader(headers, "anthropic-version", "2023-06-01");
 			}
 
-			const signal = AbortSignal.any([event.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
-			log({ ev: "request", url, preCutCount, cutIndex, payloadMsgCount: messages.length, systemOffset, bodyMsgCount: body.messages.length });
-			const data = await postJson(url, body, headers, signal);
+			const signal = event.signal;
+			log({ ev: "request", url, preCutCount, cutIndex, payloadMsgCount: messages.length, systemOffset, bodyMsgCount: body.messages.length, maxTokens, keepRecentTokens: prep.settings.keepRecentTokens });
+			const data = await postJson(url, body, headers, signal, model);
 			log({ ev: "raw-usage", usage: data.usage });
 
 			let text: string;
-			let usage: {
-				input: number;
-				output: number;
-				cacheRead: number;
-				cacheWrite: number;
-				totalTokens: number;
-				cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
-			} | undefined;
+			let usage: Usage | undefined;
 
 			if (isAnthropic) {
-				if (data.stop_reason !== "end_turn" && data.stop_reason !== "stop_sequence") {
+				if (data.stop_reason !== "end_turn" && data.stop_reason !== "stop_sequence" && data.stop_reason !== "max_tokens" && data.stop_reason !== "model_context_window_exceeded") {
 					throw new Error(`summary did not finish normally: ${data.stop_reason}`);
 				}
 				const blocks = Array.isArray(data.content) ? data.content : [];
@@ -624,7 +712,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
 					throw new Error("summary attempted to call a tool");
 				}
-				if (choice?.finish_reason !== "stop" || msg?.function_call) {
+				if ((choice?.finish_reason !== "stop" && choice?.finish_reason !== "length") || msg?.function_call) {
 					throw new Error(`summary did not finish normally: ${choice?.finish_reason}`);
 				}
 				const content = msg?.content;
@@ -655,6 +743,11 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				}
 			}
 
+			const stopReason = isAnthropic ? data.stop_reason : data.choices?.[0]?.finish_reason;
+			if (stopReason === "length" || stopReason === "max_tokens" || stopReason === "model_context_window_exceeded") {
+				throw new CompactionLimitError(`summary reached limit: ${stopReason}`, usage);
+			}
+
 			text = stripCodeFences(text);
 			if (!text) throw new Error("empty summary");
 
@@ -669,6 +762,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				},
 			};
 		} catch (err) {
+			if (err instanceof CompactionLimitError) throw err;
 			log({ ev: "fallback", stage: "error", error: err instanceof Error ? err.message : String(err) });
 			try {
 				if (ctx.hasUI) {
@@ -681,6 +775,54 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				// A UI failure must not prevent native fallback.
 			}
 			return undefined;
+		}
+	};
+
+	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+		if (!ctx.model || isExcludedProvider(ctx.model)) return undefined;
+		let current = event;
+		let usage: Usage | undefined;
+		// One deadline for the whole recovery, including transport retries.
+		const signal = AbortSignal.any([event.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+		for (let retry = 0; ; retry++) {
+			try {
+				const result = await attempt({ ...current, signal }, ctx);
+				if (result?.compaction) result.compaction.usage = addUsage(usage, result.compaction.usage);
+				return result;
+			} catch (err) {
+				if (!(err instanceof CompactionLimitError)) throw err;
+				usage = addUsage(usage, err.usage);
+				let next: ReturnType<typeof prepareRetry> = undefined;
+				if (!signal.aborted && retry < MAX_LIMIT_RETRIES) {
+					const settings = current.preparation.settings;
+					const keepRecentTokens = settings.keepRecentTokens > 0 ? settings.keepRecentTokens * 2 : 8192;
+					if (Number.isSafeInteger(keepRecentTokens)) {
+						try {
+							next = prepareRetry(current, keepRecentTokens);
+						} catch {
+							// Invalid preparation must still yield to native compaction.
+						}
+					}
+				}
+				const previousIndex = event.branchEntries.findIndex((entry) => entry.id === current.preparation.firstKeptEntryId);
+				const nextIndex = next ? event.branchEntries.findIndex((entry) => entry.id === next.firstKeptEntryId) : -1;
+				if (!next || nextIndex < 0 || nextIndex >= previousIndex) {
+					log({ ev: "fallback", stage: "limit-exhausted", retry, error: err.message, usage });
+					try {
+						if (ctx.hasUI && !signal.aborted) ctx.ui.notify(`Cache-aligned compaction limit recovery exhausted; falling back to native: ${err.message}`, "warning");
+					} catch {
+						// UI failures must not prevent native fallback.
+					}
+					return undefined;
+				}
+				log({ ev: "limit-retry", retry: retry + 1, error: err.message, keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
+				try {
+					if (ctx.hasUI) ctx.ui.notify(`Retrying cache-aligned compaction with ${next.settings.keepRecentTokens} recent tokens retained.`, "info");
+				} catch {
+					// Keep recovering even if the UI is unavailable.
+				}
+				current = { ...event, preparation: next };
+			}
 		}
 	};
 }

@@ -13,11 +13,13 @@ const { transformMessages } = await import(path.join(PI_ROOT, "node_modules/@ear
 const jiti = createJiti(path.join(PI_ROOT, "dist/index.js"), {
 	alias: {
 		"@earendil-works/pi-coding-agent": path.join(PI_ROOT, "dist/index.js"),
+		"@earendil-works/pi-ai": path.join(PI_ROOT, "node_modules/@earendil-works/pi-ai/dist/index.js"),
 	},
 	moduleCache: false,
 });
 
 const factory = await jiti.import(fileURLToPath(new URL("../text-compaction.ts", import.meta.url)), { default: true });
+const { prepareCompaction } = await import(path.join(PI_ROOT, "dist/core/compaction/compaction.js"));
 
 // ---- fake pi ------------------------------------------------------------
 const handlers = {};
@@ -703,5 +705,210 @@ for (const [maxTokens, expected] of [[64000, 32000], [20000, 20000]]) {
 	assert.deepEqual(payload, original, `${label}: original budget unchanged`);
 	console.log(`ok: ${label}`);
 }
+
+// Limit recovery uses real pi cuts, with a new retained boundary on success.
+const recoveryMessages = Array.from({ length: 48 }, (_, i) => i % 2 === 0
+	? { ...userMsg, content: `user ${i}: ` + "x".repeat(4000), timestamp: i }
+	: { ...assistantMsg, content: [{ type: "text", text: `assistant ${i}: ` + "y".repeat(4000) }], timestamp: i });
+const recoveryBranch = recoveryMessages.map((message, i) => ({
+	type: "message", id: `recovery-${i}`, parentId: i ? `recovery-${i - 1}` : null,
+	timestamp: new Date(i).toISOString(), message,
+}));
+const recoverySettings = { enabled: true, reserveTokens: 1024, keepRecentTokens: 8192 };
+const recoveryPrep = prepareCompaction(recoveryBranch, recoverySettings);
+const doubledPrep = prepareCompaction(recoveryBranch, { ...recoverySettings, keepRecentTokens: 16384 });
+assert.notEqual(recoveryPrep.firstKeptEntryId, doubledPrep.firstKeptEntryId);
+for (const anthropic of [false, true]) {
+	const currentModel = { ...(anthropic ? anthropicModel : model), maxTokens: 64000 };
+	const current = { ...ctx, model: currentModel, sessionManager: { getSessionId: () => `recovery-${anthropic}` } };
+	const payload = { ...(anthropic ? anthropicPayload : openaiPayload), messages: historyWire(recoveryMessages, currentModel) };
+	const success = () => okJson(anthropic
+		? { content: [{ type: "text", text: "Complete summary" }], stop_reason: "end_turn", usage: { input_tokens: 10, cache_read_input_tokens: 900, output_tokens: 20 } }
+		: { choices: [{ message: { content: "Complete summary" }, finish_reason: "stop" }], usage: { prompt_tokens: 910, prompt_cache_hit_tokens: 900, completion_tokens: 20 } });
+	const truncated = (reason) => okJson(anthropic
+		? { content: [{ type: "text", text: "Partial" }], stop_reason: reason, usage: { input_tokens: 10, cache_read_input_tokens: 1000, output_tokens: 100 } }
+		: { choices: [{ message: { content: "Partial" }, finish_reason: reason }], usage: { prompt_tokens: 1010, prompt_cache_hit_tokens: 1000, completion_tokens: 100 } });
+	for (const failure of [
+		{ name: "length", response: truncated(anthropic ? "max_tokens" : "length"), output: 120, cached: 1900 },
+		...(anthropic ? [{ name: "context stop", response: truncated("model_context_window_exceeded"), output: 120, cached: 1900 }] : []),
+		{ name: "HTTP overflow", response: bad(400, '{"error":{"code":"context_length_exceeded","message":"Maximum context length exceeded"}}'), output: 20, cached: 900 },
+	]) {
+		capture(current, { payload, contextMessages: recoveryMessages });
+		fetchCalls.length = 0;
+		responseQueue = [failure.response, success()];
+		const event = compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch });
+		const original = structuredClone({ payload, event: { ...event, signal: undefined } });
+		result = await handlers.session_before_compact[0](event, current);
+		assert.equal(result?.compaction?.summary, "Complete summary", failure.name);
+		assert.equal(fetchCalls.length, 2);
+		assert.equal(result.compaction.firstKeptEntryId, doubledPrep.firstKeptEntryId);
+		assert.equal(result.compaction.usage.output, failure.output);
+		assert.equal(result.compaction.usage.cacheRead, failure.cached);
+		const [first, second] = fetchCalls.map(call => JSON.parse(call.init.body));
+		assert.equal(first.max_tokens, 8192);
+		assert.equal(second.max_tokens, 16384);
+		assert.ok(second.messages.length < first.messages.length);
+		assert.deepEqual(second.messages.slice(0, -1), first.messages.slice(0, second.messages.length - 1));
+		assert.deepEqual(second.tools, first.tools);
+		assert.deepEqual({ payload, event: { ...event, signal: undefined } }, original);
+		console.log(`ok: AC: ${currentModel.api} ${failure.name}: earlier cut, larger budget, exact prefix, cumulative usage`);
+	}
+
+	capture(current, { payload, contextMessages: recoveryMessages });
+	fetchCalls.length = 0;
+	responseQueue = [truncated(anthropic ? "max_tokens" : "length"), truncated(anthropic ? "max_tokens" : "length"), success()];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch }), current);
+	assert.equal(result?.compaction?.summary, "Complete summary");
+	assert.deepEqual(fetchCalls.map(call => JSON.parse(call.init.body).max_tokens), [8192, 16384, 32768]);
+	assert.equal(result.compaction.firstKeptEntryId, prepareCompaction(recoveryBranch, { ...recoverySettings, keepRecentTokens: 32768 }).firstKeptEntryId);
+
+	fetchCalls.length = 0;
+	responseQueue = Array.from({ length: 8 }, () => truncated(anthropic ? "max_tokens" : "length"));
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch }), current);
+	assert.equal(result, undefined);
+	assert.equal(fetchCalls.length, 3, "stop before retaining all history");
+
+	fetchCalls.length = 0;
+	const smallPrep = prepareCompaction(recoveryBranch, { ...recoverySettings, keepRecentTokens: 1 });
+	responseQueue = [truncated(anthropic ? "max_tokens" : "length")];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: smallPrep, branchEntries: recoveryBranch }), current);
+	assert.equal(result, undefined);
+	assert.equal(fetchCalls.length, 1, "unchanged cut stops retries");
+
+	fetchCalls.length = 0;
+	responseQueue = Array.from({ length: 8 }, () => truncated(anthropic ? "max_tokens" : "length"));
+	const boundedPrep = prepareCompaction(recoveryBranch, { ...recoverySettings, keepRecentTokens: 1024 });
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: boundedPrep, branchEntries: recoveryBranch }), current);
+	assert.equal(result, undefined);
+	assert.equal(fetchCalls.length, 5, "at most four limit retries");
+
+	for (const response of [bad(401, "context token limit"), bad(400, "invalid max_tokens parameter"), bad(400, "token quota limit exceeded"), bad(400, "max_tokens exceeds the model output limit"), bad(429, "rate limit")]) {
+		fetchCalls.length = 0;
+		responseQueue = [response, response];
+		result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch }), current);
+		assert.equal(result, undefined);
+		assert.ok(fetchCalls.every(call => JSON.parse(call.init.body).max_tokens === 8192), "unrelated errors never change budget");
+	}
+	const controller = new AbortController();
+	controller.abort();
+	fetchCalls.length = 0;
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch, signal: controller.signal }), current);
+	assert.equal(result, undefined);
+	assert.equal(fetchCalls.length, 0, "abort sends no requests");
+	console.log(`ok: AC: ${currentModel.api}: repeated doubling, exhaustion, unchanged cut, retry cap, unrelated errors, abort`);
+}
+
+// Pi 0.86 prompt-state entries are absent from native preparation, not the wire.
+const systemContext = { role: "system", content: "SYS", timestamp: 0 };
+for (const current of [ctx, anthropicCtx]) {
+	const anthropic = current.model.api === "anthropic-messages";
+	const payload = anthropic ? anthropicPayload : openaiPayload;
+	capture(current, { contextMessages: [systemContext, userMsg, assistantMsg, userNextCtx], payload });
+	fetchCalls.length = 0;
+	responseQueue = [okJson(anthropic
+		? { content: [{ type: "text", text: "With system state" }], stop_reason: "end_turn" }
+		: { choices: [{ message: { content: "With system state" }, finish_reason: "stop" }] })];
+	result = await handlers.session_before_compact[0](compactEvent(), current);
+	assert.equal(result?.compaction?.summary, "With system state");
+	assert.equal(fetchCalls.length, 1);
+	assert.deepEqual(JSON.parse(fetchCalls[0].init.body).messages.slice(0, -1), payload.messages.slice(0, -1));
+	console.log(`ok: AD: ${current.model.api}: leading transcript system state preserves captured wire prefix`);
+}
+
+// Repeated compaction must not resurrect entries before the previous kept boundary.
+const prior = {
+	type: "compaction", id: "prior-checkpoint", parentId: recoveryBranch[15].id,
+	timestamp: new Date(16).toISOString(), summary: "Previous checkpoint", firstKeptEntryId: recoveryBranch[8].id, tokensBefore: 20000,
+};
+const repeatedBranch = [...recoveryBranch.slice(0, 16), prior, ...recoveryBranch.slice(16)];
+const repeatedPrep = prepareCompaction(repeatedBranch, recoverySettings);
+const repeatedNext = prepareCompaction(repeatedBranch, { ...recoverySettings, keepRecentTokens: 16384 });
+const repeatedSummary = { role: "compactionSummary", summary: prior.summary, tokensBefore: prior.tokensBefore, timestamp: 16 };
+const repeatedContext = [systemContext, repeatedSummary, ...recoveryMessages.slice(8)];
+const repeatedModel = { ...model, maxTokens: 64000 };
+const repeatedCtx = { ...ctx, model: repeatedModel };
+const repeatedPayload = { ...openaiPayload, messages: [openaiPayload.messages[0], { role: "user", content: "Previous checkpoint" }, ...historyWire(recoveryMessages.slice(8), repeatedModel).slice(1)] };
+capture(repeatedCtx, { contextMessages: repeatedContext, payload: repeatedPayload });
+fetchCalls.length = 0;
+responseQueue = [okJson({ choices: [{ message: { content: "partial" }, finish_reason: "length" }] }), okJson({ choices: [{ message: { content: "Updated checkpoint" }, finish_reason: "stop" }] })];
+result = await handlers.session_before_compact[0](compactEvent({ preparation: repeatedPrep, branchEntries: repeatedBranch }), repeatedCtx);
+assert.equal(result?.compaction?.summary, "Updated checkpoint");
+assert.equal(result.compaction.firstKeptEntryId, repeatedNext.firstKeptEntryId);
+assert.equal(fetchCalls.length, 2);
+for (const call of fetchCalls) {
+	const sent = JSON.parse(call.init.body);
+	assert.deepEqual(sent.messages.slice(0, -1), repeatedPayload.messages.slice(0, sent.messages.length - 1));
+	assert.match(sent.messages.at(-1).content, /<previous-summary>\nPrevious checkpoint\n<\/previous-summary>/);
+}
+console.log("ok: AE: retry after prior compaction preserves previous summary and active history boundary");
+
+// HTTP classification delegates provider wording to pi-ai, without echoed requests.
+const classifiedCtx = { ...ctx, model: { ...model, maxTokens: 64000 } };
+const classifiedPayload = { ...openaiPayload, messages: historyWire(recoveryMessages, classifiedCtx.model) };
+capture(classifiedCtx, { payload: classifiedPayload, contextMessages: recoveryMessages });
+const completeResponse = () => okJson({ choices: [{ message: { content: "Recovered" }, finish_reason: "stop" }] });
+for (const [status, text, recover] of [
+	[400, JSON.stringify({ error: { code: "context_length_exceeded", message: "Reduce the conversation" } }), true],
+	[422, JSON.stringify({ error: { type: "model_context_window_exceeded" } }), true],
+	[413, JSON.stringify({ code: "request_too_large" }), true],
+	[400, JSON.stringify({ error: { type: "invalid_request_error", message: "prompt is too long: 250000 tokens > 200000 maximum" } }), true],
+	[400, "This model's maximum context length is 8192 tokens. You requested 9000 tokens.", true],
+	[400, "context_length_exceeded", true],
+	[400, "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)", true],
+	[400, "Your input exceeds the context window of this model", true],
+	[400, "the request exceeds the available context size, try increasing it", true],
+	[400, "Range of input length should be [1, 32768]", true],
+	[400, "Prompt has 9000 tokens, but the configured context size is 8192 tokens", true],
+	[400, "Please reduce the length of the messages or completion", true],
+	[400, "Input length 9000 exceeds the maximum allowed input length of 8192 tokens.", true],
+	[400, "Throttling error: Too many tokens, please wait before trying again.", false],
+	[400, "Rate limit: too many tokens", false],
+	[400, "Input token quota exceeded for this organization", false],
+	[400, "Input tokens per minute exceeded", false],
+	[400, JSON.stringify({ error: { code: "rate_limit_exceeded", message: "Input tokens exceed the limit" } }), false],
+	[400, JSON.stringify({ error: { code: "insufficient_quota", message: "maximum context length" } }), false],
+	[400, JSON.stringify({ error: { code: "invalid_api_key", type: "authentication_error", message: "maximum context length" } }), false],
+	[400, JSON.stringify({ error: { code: "invalid_request_error", message: "Invalid tools schema" }, request: { prompt: "context_length_exceeded" } }), false],
+	[400, JSON.stringify({ prompt: "context_length_exceeded", metadata: { message: "prompt is too long" } }), false],
+	[400, JSON.stringify({ error: { code: "invalid_request_error", message: "max_tokens exceeds the model output limit" } }), false],
+	[413, "Request entity too large", false],
+	[401, "context_length_exceeded", false],
+	[429, "context_length_exceeded", false],
+	[500, "context_length_exceeded", false],
+]) {
+	fetchCalls.length = 0;
+	responseQueue = [bad(status, text), completeResponse()];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch }), classifiedCtx);
+	const budgets = fetchCalls.map(call => JSON.parse(call.init.body).max_tokens);
+	assert.deepEqual(budgets, recover ? [8192, 16384] : status === 429 || status === 500 ? [8192, 8192] : [8192], text);
+	assert.equal(result?.compaction?.firstKeptEntryId, recover ? doubledPrep.firstKeptEntryId : status === 429 || status === 500 ? recoveryPrep.firstKeptEntryId : undefined, text);
+}
+for (const provider of ["cerebras", model.provider]) {
+	const current = { ...classifiedCtx, model: { ...classifiedCtx.model, provider } };
+	capture(current, { payload: classifiedPayload, contextMessages: recoveryMessages });
+	fetchCalls.length = 0;
+	responseQueue = [bad(413, ""), completeResponse()];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch }), current);
+	assert.equal(fetchCalls.length, provider === "cerebras" ? 2 : 1, "pi-ai's bodyless overflow rule is provider-specific");
+	assert.equal(result?.compaction?.firstKeptEntryId, provider === "cerebras" ? doubledPrep.firstKeptEntryId : undefined);
+}
+console.log("ok: AF: pi-ai overflow detection across providers, transport status guards, no echoed-prompt matches");
+
+for (const phase of ["auth", "response-json", "error-body"]) {
+	const abort = new AbortController();
+	const current = phase === "auth" ? {
+		...classifiedCtx,
+		modelRegistry: { getApiKeyAndHeaders: async () => { abort.abort(); return { ok: true, apiKey: "resolved-key" }; } },
+	} : classifiedCtx;
+	capture(current, { payload: classifiedPayload, contextMessages: recoveryMessages });
+	fetchCalls.length = 0;
+	responseQueue = [() => phase === "error-body"
+		? { ok: false, status: 429, text: async () => { abort.abort(); return "rate limited"; } }
+		: { ok: true, status: 200, json: async () => { abort.abort(); return { choices: [{ message: { content: "Must not persist" }, finish_reason: "stop" }] }; } }];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: recoveryPrep, branchEntries: recoveryBranch, signal: abort.signal }), current);
+	assert.equal(result, undefined, `abort during ${phase} must not return a checkpoint`);
+	assert.equal(fetchCalls.length, phase === "auth" ? 0 : 1, `abort during ${phase} must not send another request`);
+}
+console.log("ok: AG: cancellation during auth, successful response parsing, and error body stops requests/checkpoints");
 
 console.log(process.exitCode ? "\nSOME TESTS FAILED" : "\nALL TESTS PASSED");
