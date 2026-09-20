@@ -40,9 +40,9 @@ export async function showAgents(
 				const innerWidth = Math.max(1, width - 4);
 				const content = agents.map((agent) => [
 					theme.fg("accent", theme.bold(`${agent.name || "Unnamed session"}${agent.id === self ? " (you)" : ""}`))
-						+ theme.fg("muted", ` — ${agent.status}`),
+						+ theme.fg("muted", ` — ${agent.kind ?? "pi"} · ${agent.status}`),
 					theme.fg("dim", agent.id),
-					`${agent.provider ?? "No provider"}/${agent.model ?? "No model"}`,
+					`${agent.provider ?? "No provider"}/${agent.model ?? (agent.kind === "claude" ? "model unknown" : "No model")}`,
 					theme.fg("muted", agent.cwd),
 				].join("\n")).join("\n\n");
 				const lines = new Text(content || message, 0, 0).render(innerWidth);

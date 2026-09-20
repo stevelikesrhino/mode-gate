@@ -18,7 +18,8 @@ export type AgentInfo = {
 	cwd: string;
 	provider?: string;
 	model?: string;
-	status: "idle" | "busy" | "unavailable";
+	status: "idle" | "busy" | "unavailable" | "unknown";
+	kind?: "pi" | "claude";
 };
 
 export type Request = { kind: "info" } | { kind: "text"; from: { id: string; name?: string }; text: string };
@@ -83,24 +84,50 @@ function readFrame(socket: Socket, receive: (value: unknown) => void, key?: Buff
 	});
 }
 
-export async function listen(path: string, receive: (value: unknown) => Response): Promise<() => Promise<void>> {
+function parseResponse(value: unknown, id: string): Response | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return;
+	const response = value as Response;
+	if (response.status === "ok") {
+		const agent = response.agent;
+		if (!agent || agent.id !== id
+			|| typeof agent.sessionId !== "string" || !agent.sessionId || agent.sessionId.length > 128
+			|| typeof agent.cwd !== "string" || agent.cwd.length > 300
+			|| !["idle", "busy", "unavailable", "unknown"].includes(agent.status)
+			|| (agent.kind !== undefined && agent.kind !== "pi" && agent.kind !== "claude")) return;
+		for (const [field, limit] of [[agent.name, 120], [agent.provider, 80], [agent.model, 120]] as const) {
+			if (field !== undefined && (typeof field !== "string" || field.length > limit)) return;
+		}
+		return { status: "ok", agent: {
+			id, sessionId: agent.sessionId, cwd: agent.cwd, name: agent.name,
+			provider: agent.provider, model: agent.model, status: agent.status, kind: agent.kind,
+		} };
+	}
+	if (!["accepted", "rejected", "unknown"].includes(response.status)
+		|| (response.reason !== undefined && (typeof response.reason !== "string" || response.reason.length > 2048))) return;
+	return { status: response.status, reason: response.reason };
+}
+
+export async function listen(path: string, receive: (value: unknown) => Response | Promise<Response>): Promise<() => Promise<void>> {
 	const key = WINDOWS ? randomBytes(32) : undefined;
 	const sockets = new Set<Socket>();
 	const server = createServer((socket) => {
 		sockets.add(socket);
-		socket.on("close", () => sockets.delete(socket));
+		const timer = setTimeout(() => socket.destroy(), TIMEOUT_MS);
+		socket.on("close", () => { clearTimeout(timer); sockets.delete(socket); });
 		socket.on("error", () => socket.destroy());
-		socket.setTimeout(TIMEOUT_MS, () => socket.destroy());
 		readFrame(socket, (value) => {
-			let response: Response;
-			try {
-				response = receive(value);
-			} catch (error) {
-				response = { status: "rejected", reason: error instanceof Error ? error.message : String(error) };
-			}
-			socket.end(frame(response, key));
+			void (async () => {
+				let response: Response;
+				try {
+					response = await receive(value);
+				} catch (error) {
+					response = { status: "rejected", reason: error instanceof Error ? error.message : String(error) };
+				}
+				if (!socket.destroyed) socket.end(frame(response, key));
+			})().catch(() => socket.destroy());
 		}, key);
 	});
+	server.maxConnections = 128;
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(WINDOWS ? { host: "127.0.0.1", port: 0 } : { path }, () => {
@@ -175,9 +202,8 @@ export async function request(directory: string, id: string, message: Request, s
 			: `Unavailable: ${error.code ?? error.message} (offline, stopped, or stale ID).`));
 		socket.on("close", () => fail("Connection closed without acknowledgement."));
 		readFrame(socket, (value) => {
-			const response = value as Response | null;
-			if (!response || !["ok", "accepted", "rejected", "unknown"].includes(response.status)
-				|| (response.status === "ok" && (!response.agent || response.agent.id !== id))) {
+			const response = parseResponse(value, id);
+			if (!response) {
 				fail("Invalid acknowledgement.");
 				return;
 			}
