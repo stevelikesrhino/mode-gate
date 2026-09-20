@@ -3,9 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
 	CONFIG_DIR_NAME,
-	formatSkillsForPrompt,
 	getAgentDir,
-	type BuildSystemPromptOptions,
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -66,24 +64,6 @@ function readPrompt(path: string, baseDir: string): string {
 	return readFileSync(resolve(baseDir, expanded), "utf8");
 }
 
-// Pi 0.85's context/skills suffix. Keep the native base instructions opaque.
-function contextSuffix(options: BuildSystemPromptOptions): string {
-	let suffix = "";
-	if (options.contextFiles?.length) {
-		suffix += "\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n";
-		for (const { path, content } of options.contextFiles) {
-			suffix += `<project_instructions path="${path}">\n${content}\n</project_instructions>\n\n`;
-		}
-		suffix += "</project_context>\n";
-	}
-	const tools = options.selectedTools ?? ["read", "bash", "edit", "write"];
-	const readTool = (["read", "bash"] as const).find((tool) => tools.includes(tool));
-	if (readTool && options.skills?.length) suffix += formatSkillsForPrompt(options.skills, readTool);
-	suffix += `\nCurrent working directory: ${options.cwd.replace(/\\/g, "/")}`;
-	if (options.customPrompt) suffix += "\n";
-	return suffix;
-}
-
 export default function modelSystemPrompt(pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) => {
 		if (event.reason !== "startup" || ctx.mode !== "tui") return;
@@ -103,29 +83,17 @@ export default function modelSystemPrompt(pi: ExtensionAPI): void {
 			if (!rule) return;
 
 			const options = event.systemPromptOptions;
-			const oldSuffix = contextSuffix(options);
-			const boundary = event.systemPrompt.lastIndexOf(oldSuffix);
-			if (boundary < 0) throw new Error("Cannot identify Pi's context suffix; leaving prompt unchanged");
-			let base = event.systemPrompt.slice(0, boundary);
-			const trailing = event.systemPrompt.slice(boundary + oldSuffix.length);
-			const oldAppend = options.appendSystemPrompt ? `\n\n${options.appendSystemPrompt}` : "";
-			if (oldAppend && !base.endsWith(oldAppend)) {
-				throw new Error("Another extension changed the append section; leaving prompt unchanged");
+			if (options.forceSystemPrompt !== undefined) {
+				throw new Error("Another extension forced the system prompt; leaving prompt unchanged");
 			}
-			if (oldAppend) base = base.slice(0, -oldAppend.length);
 
 			const customPath = rule.files["SYSTEM.md"];
 			const appendPath = rule.files["APPEND_SYSTEM.md"];
 			const custom = customPath === undefined ? options.customPrompt : readPrompt(customPath, rule.baseDir);
-			if (customPath !== undefined) {
-				if (!custom?.trim()) throw new Error(`Empty SYSTEM.md: ${customPath}`);
-				base = custom;
-			}
+			if (customPath !== undefined && !custom?.trim()) throw new Error(`Empty SYSTEM.md: ${customPath}`);
 			const append = appendPath === undefined ? options.appendSystemPrompt : readPrompt(appendPath, rule.baseDir);
-			return {
-				systemPrompt: base + (append ? `\n\n${append}` : "")
-					+ contextSuffix({ ...options, customPrompt: custom }) + trailing,
-			};
+			if (customPath !== undefined) options.customPrompt = custom;
+			if (appendPath !== undefined) options.appendSystemPrompt = append;
 		} catch (error) {
 			const message = `model-system-prompt: ${error instanceof Error ? error.message : String(error)}`;
 			if (ctx.hasUI) ctx.ui.notify(message, "error");
