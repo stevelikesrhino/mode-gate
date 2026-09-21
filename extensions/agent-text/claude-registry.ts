@@ -1,4 +1,5 @@
-import { readFile, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readFile, readdir, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -6,6 +7,7 @@ type OwnerRecord = {
 	pid: number;
 	version: string;
 	kind: "interactive" | "bg";
+	jobId?: string;
 	messagingSocketPath: string;
 	spare?: boolean;
 	parkedJobId?: string;
@@ -29,13 +31,51 @@ async function readOwner(pid: number): Promise<OwnerRecord> {
 	return record;
 }
 
-export async function ownerUnavailable(pid: number, inbox: string): Promise<string | undefined> {
+export async function ownerInfo(pid: number, inbox: string): Promise<{ reason?: string; jobId?: string }> {
 	try {
 		const record = await readOwner(pid);
-		if (record.messagingSocketPath !== inbox) return "Claude owner record does not match this adapter's inbox.";
-		if (record.spare === true || record.parkedJobId !== undefined) return "Claude owner is a spare worker or parked launcher.";
+		if (record.messagingSocketPath !== inbox) return { reason: "Claude owner record does not match this adapter's inbox." };
+		if (record.spare === true || record.parkedJobId !== undefined) return { reason: "Claude owner is a spare worker or parked launcher." };
+		return { jobId: record.kind === "bg" ? record.jobId : undefined };
 	} catch {
-		return "Claude owner record is missing, unreadable, or incompatible. Run /agent-text setup-claude in Pi to check compatibility.";
+		return { reason: "Claude owner record is missing, unreadable, or incompatible. Run /agent-text setup-claude in Pi to check compatibility." };
+	}
+}
+
+export async function jobModel(jobId: unknown): Promise<string | undefined> {
+	if (typeof jobId !== "string" || !/^[a-f0-9]{8}$/.test(jobId)) return;
+	let file: FileHandle | undefined;
+	try {
+		const openFlags = constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NONBLOCK);
+		file = await open(join(registryDirectory(), "..", "jobs", jobId, "state.json"), openFlags);
+		const limit = 64 * 1024;
+		const stat = await file.stat();
+		if (!stat.isFile() || stat.size > limit) return;
+		const buffer = Buffer.alloc(limit + 1);
+		let bytesRead = 0;
+		while (bytesRead < buffer.length) {
+			const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+			if (result.bytesRead === 0) break;
+			bytesRead += result.bytesRead;
+		}
+		if (bytesRead > limit) return;
+		const flags = JSON.parse(buffer.toString("utf8", 0, bytesRead))?.respawnFlags;
+		if (!Array.isArray(flags) || !flags.every((flag) => typeof flag === "string")) return;
+		let model: string | undefined;
+		for (let i = 0; i < flags.length && flags[i] !== "--"; i++) {
+			const flag = flags[i];
+			let value: string | undefined;
+			if (flag === "--model" || flag === "-m") value = flags[++i];
+			else if (flag.startsWith("--model=") || flag.startsWith("-m=")) value = flag.slice(flag.indexOf("=") + 1);
+			else continue;
+			if (!value || value.length > 120 || value.startsWith("-") || /[\s\x00-\x1f\x7f-\x9f]/.test(value)) return;
+			model = value;
+		}
+		return model === "default" ? undefined : model;
+	} catch {
+		// Optional metadata must not hide a reachable agent or block messaging.
+	} finally {
+		await file?.close().catch(() => {});
 	}
 }
 

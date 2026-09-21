@@ -32,7 +32,8 @@ Agents use `list_agent` and `text_agent({ ids: ["agent-id"], text: "message" })`
 ## Limitations
 
 - Local, same-user communication only. One Claude registration targets one Pi profile.
-- Claude model and activity are unknown. Spare workers and parked launchers are hidden; live detached sessions remain visible.
+- Claude background model aliases are read from job state on discovery, not from hooks or transcripts. Default models, interactive sessions, and missing/invalid/oversized state report unknown; aliases are not resolved per-request model IDs. Activity remains unknown.
+- Spare workers and parked launchers are hidden; live detached sessions remain visible.
 - Filtering depends on Claude's internal session registry. Missing or incompatible owner records disable that adapter's messaging; Claude updates may require an adapter update.
 - At most 20 recipients and 16 KiB per message. An accepted receipt does not guarantee model processing; never automatically retry an unknown delivery.
 - Native Windows runtime behavior has not been verified.

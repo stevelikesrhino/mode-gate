@@ -38,6 +38,8 @@ export async function showAgents(
 		return {
 			render(width) {
 				const innerWidth = Math.max(1, width - 4);
+				const height = Math.max(1, Math.floor(tui.terminal.rows * 61.8 / 100));
+				const compact = height < 8;
 				const content = agents.map((agent) => [
 					theme.fg("accent", theme.bold(`${agent.name || "Unnamed session"}${agent.id === self ? " (you)" : ""}`))
 						+ theme.fg("muted", ` — ${agent.kind ?? "pi"} · ${agent.status}`),
@@ -46,7 +48,7 @@ export async function showAgents(
 					theme.fg("muted", agent.cwd),
 				].join("\n")).join("\n\n");
 				const lines = new Text(content || message, 0, 0).render(innerWidth);
-				pageSize = Math.max(1, Math.min(18, tui.terminal.rows - 8));
+				pageSize = Math.max(0, height - (compact ? 2 : 7));
 				maxOffset = Math.max(0, lines.length - pageSize);
 				offset = Math.min(offset, maxOffset);
 				const row = (text: string) => {
@@ -56,16 +58,16 @@ export async function showAgents(
 				const up = keybindings.getKeys("tui.select.up")[0] ?? "unbound";
 				const down = keybindings.getKeys("tui.select.down")[0] ?? "unbound";
 				const close = keybindings.getKeys("tui.select.cancel")[0] ?? "unbound";
-				const position = maxOffset ? ` · ${offset + 1}–${Math.min(offset + pageSize, lines.length)}/${lines.length}` : "";
+				const position = maxOffset && pageSize ? ` · ${offset + 1}–${Math.min(offset + pageSize, lines.length)}/${lines.length}` : "";
 				return [
-					theme.fg("border", "╭" + "─".repeat(Math.max(0, width - 2)) + "╮"),
+					...(compact ? [] : [theme.fg("border", "╭" + "─".repeat(Math.max(0, width - 2)) + "╮")]),
 					row(theme.fg("accent", `Online agents (${agents.length})`) + theme.fg("dim", refreshing ? " · refreshing..." : position)),
-					row(""),
-					...lines.slice(offset, offset + pageSize).map(row),
-					row(""),
+					...(compact ? [] : [row("")]),
+					...Array.from({ length: pageSize }, (_, index) => row(lines[offset + index] ?? "")),
+					...(compact ? [] : [row(""), row(theme.fg("dim", "Claude Code: <- to 'agent' to refresh model name."))]),
 					row(theme.fg("dim", `${up}/${down} scroll · R refresh · ${close} close`)),
-					theme.fg("border", "╰" + "─".repeat(Math.max(0, width - 2)) + "╯"),
-				].map((line) => truncateToWidth(line, width));
+					...(compact ? [] : [theme.fg("border", "╰" + "─".repeat(Math.max(0, width - 2)) + "╯")]),
+				].slice(0, height).map((line) => truncateToWidth(line, width));
 			},
 			handleInput(data) {
 				if (keybindings.matches(data, "tui.select.cancel")) {
@@ -84,5 +86,5 @@ export async function showAgents(
 			invalidate() {},
 			dispose() { closed = true; controller.abort(); },
 		};
-	}, { overlay: true, overlayOptions: { width: "90%", margin: 1 } });
+	}, { overlay: true, overlayOptions: { anchor: "bottom-left", width: "100%", maxHeight: "61.8%", margin: 0 } });
 }

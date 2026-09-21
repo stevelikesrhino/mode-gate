@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { listen, MAX_TEXT_BYTES, privateDirectory, socketDirectory, type AgentInfo, type Receipt, type Request, type Response } from "./ipc.ts";
 import { agentList, discoverAgents, GUIDELINES, LIST_DESCRIPTION, messageText, sendText, TEXT_DESCRIPTION, textMessage } from "./messaging.ts";
-import { ownerUnavailable, verifyRegistry } from "./claude-registry.ts";
+import { jobModel, ownerInfo, verifyRegistry } from "./claude-registry.ts";
 
 async function main(): Promise<void> {
 	if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Agent text requires Node.js 22 or later.");
@@ -125,9 +125,11 @@ async function main(): Promise<void> {
 
 	async function receive(value: unknown): Promise<Response> {
 		if (outgoing.signal.aborted) return { status: "rejected", reason: "Claude adapter stopped." };
-		const unavailable = await ownerUnavailable(ownerPid, inbox!);
-		if (unavailable) return { status: "rejected", reason: unavailable };
-		if (value && typeof value === "object" && (value as { kind?: unknown }).kind === "info") return { status: "ok", agent };
+		const owner = await ownerInfo(ownerPid, inbox!);
+		if (owner.reason) return { status: "rejected", reason: owner.reason };
+		if (value && typeof value === "object" && (value as { kind?: unknown }).kind === "info") {
+			return { status: "ok", agent: { ...agent, model: await jobModel(owner.jobId) } };
+		}
 		const message = textMessage(value);
 		if (!message) return { status: "rejected", reason: "Invalid message; text must be nonempty and at most 16 KiB." };
 		if (message.from.id === id) return { status: "rejected", reason: "Cannot text yourself." };
@@ -169,8 +171,8 @@ async function main(): Promise<void> {
 		try {
 			if (!ready) throw new Error("MCP initialization has not completed.");
 			await ready;
-			const unavailable = await ownerUnavailable(ownerPid, inbox!);
-			if (unavailable) throw new Error(unavailable);
+			const owner = await ownerInfo(ownerPid, inbox!);
+			if (owner.reason) throw new Error(owner.reason);
 			const signal = AbortSignal.any([outgoing.signal, extra.signal]);
 			signal.throwIfAborted();
 			let result: unknown;
