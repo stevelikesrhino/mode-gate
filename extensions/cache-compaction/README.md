@@ -12,13 +12,15 @@ The standard `openai` provider is deliberately excluded from the text path. Upst
 
 ## Behavior
 
-Pi owns manual, threshold, overflow, and between-turn compaction timing on pi 0.84.4 and later. Neither path registers tree-navigation or branch-summary handlers.
+Requires pi 0.87.0 or later. Pi owns manual, threshold, overflow, and between-turn compaction timing. Neither path registers tree-navigation or branch-summary handlers.
 
 The text path preserves pi's `firstKeptEntryId`, including `keepRecentTokens` and split-turn cut selection. It summarizes the history and turn prefix together in one request. Captured provider message content is reused without changing tool selection. If truncation removes an Anthropic conversation cache breakpoint, its TTL and cache policy move to the last eligible retained block. SDK-only beta/profile parameters are translated into HTTP headers; OAuth and Copilot credentials use bearer authentication. Unknown wire mappings or divergent history fall back to native compaction. Cache reads depend on the provider's serialization, cache availability, and breakpoints; they are not guaranteed for every supported API shape.
 
 The Codex path preserves upstream's opaque checkpoint format and replay rules, so sessions created by the npm extension remain readable. Its remote replacement history has its own recent-user-message retention policy, distinct from the text path's retained tail. It fails closed if a checkpoint is malformed or belongs to another Codex model. Switching providers cannot translate opaque history into text; only surviving pi messages remain available to other providers. Local Codex checkpoint markers are filtered from live context.
 
-For older pi releases, the vendored Codex adapter retains upstream's legacy guard and `pi-codex-compaction.json` configuration. Modern pi uses its normal compaction settings instead.
+Use Pi's normal compaction settings, including `compaction.modelOverrides`. Legacy `pi-codex-compaction.json` settings are no longer read.
+
+Codex replay honors append-only context edits in the post-checkpoint tail. Edits targeting history already absorbed into an opaque checkpoint fail closed. Text compaction uses Pi's projected preparation; if a limit failure requires a new cut on a branch containing context edits, it yields to native compaction rather than reconstructing an edit-unaware boundary.
 
 ## Loading and migration
 
@@ -39,6 +41,14 @@ node extensions/cache-compaction/tests/combined.mjs
 
 Both suites stub network calls. Set `PI_ROOT` if pi is installed somewhere other than `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent`.
 
+Live tests use configured credentials and make billed requests. They use synthetic data, isolated sessions, and in-memory settings/model limits; shared `models.json` and `settings.json` are not changed:
+
+```sh
+PI_LIVE_COMPACTION=1 node extensions/cache-compaction/tests/live.mjs openai-codex gpt-5.6-luna
+PI_LIVE_COMPACTION=1 node extensions/cache-compaction/tests/live.mjs openai gpt-5.6-luna
+PI_LIVE_COMPACTION=1 node extensions/cache-compaction/tests/live.mjs deepseek deepseek-flash
+```
+
 ## Attribution and license
 
 The code under `codex/` is derived from **Can Celik** ([ogulcancelik](https://github.com/ogulcancelik))'s **[@ogulcancelik/pi-codex-compaction](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-codex-compaction)**, version **0.1.5**.
@@ -52,4 +62,4 @@ Local adaptations:
 - Honor resolved authentication's base-URL override and bound the remote request to five minutes.
 - Use plain-text status labels.
 
-`codex/native-compaction.ts` and `codex/config.ts` otherwise match the installed upstream v0.1.5 sources. There is no runtime dependency on the original npm package.
+The native adapter also projects context edits during replay. The legacy timing/configuration adapter has been removed. There is no runtime dependency on the original npm package.

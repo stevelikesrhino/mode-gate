@@ -2,9 +2,8 @@
 // Copyright (c) 2025 Can Celik. MIT license: ./LICENSE.
 import { createHash } from "node:crypto";
 import {
-	buildSessionContext,
+	buildSessionProjection,
 	convertToLlm,
-	sessionEntryToContextMessages,
 	type SessionEntry,
 	type ToolInfo,
 } from "@earendil-works/pi-coding-agent";
@@ -288,27 +287,12 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	return items;
 }
 
-function entriesToResponseItems(model: Model<any>, entries: SessionEntry[], tools: ToolInfo[]): ResponseItem[] {
-	const messages = entries.flatMap((entry) => sessionEntryToContextMessages(entry));
-	return messagesToResponseItems(model, convertToLlm(messages), tools);
-}
-
 export function effectiveInputForBranch(params: {
 	branch: SessionEntry[];
 	model: Model<any>;
 	tools: ToolInfo[];
-	excludeLastAssistantError?: boolean;
 }): ResponseItem[] {
-	let branch = params.branch;
-	if (params.excludeLastAssistantError) {
-		const lastAssistantIndex = branch.findLastIndex(
-			(entry) => entry.type === "message" && entry.message.role === "assistant",
-		);
-		if (lastAssistantIndex >= 0) {
-			branch = branch.filter((_entry, index) => index !== lastAssistantIndex);
-		}
-	}
-
+	const { branch } = params;
 	const checkpoint = findNativeCheckpoint(branch);
 	if (checkpoint.status === "invalid") {
 		throw new Error("The latest OpenAI Codex native compaction checkpoint is malformed.");
@@ -318,13 +302,23 @@ export function effectiveInputForBranch(params: {
 			throw new Error("The latest OpenAI Codex native compaction checkpoint belongs to a different model.");
 		}
 		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
+		const tailIds = new Set(tail.map((entry) => entry.id));
+		const opaqueEdit = tail.find(
+			(entry) => entry.type === "context_edit" && !tailIds.has(entry.targetId),
+		);
+		if (opaqueEdit?.type === "context_edit") {
+			throw new Error(
+				"A context edit targets history inside the latest OpenAI Codex native compaction checkpoint.",
+			);
+		}
+		const tailMessages = buildSessionProjection(tail).messages;
 		return [
 			...checkpoint.checkpoint.details.replacementHistory.map(cloneItem),
-			...entriesToResponseItems(params.model, tail, params.tools),
+			...messagesToResponseItems(params.model, convertToLlm(tailMessages), params.tools),
 		];
 	}
 
-	const context = buildSessionContext(branch);
+	const context = buildSessionProjection(branch);
 	return messagesToResponseItems(params.model, convertToLlm(context.messages), params.tools);
 }
 

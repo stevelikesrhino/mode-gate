@@ -20,6 +20,7 @@ const jiti = createJiti(path.join(PI_ROOT, "dist/index.js"), {
 
 const factory = await jiti.import(fileURLToPath(new URL("../text-compaction.ts", import.meta.url)), { default: true });
 const { prepareCompaction } = await import(path.join(PI_ROOT, "dist/core/compaction/compaction.js"));
+const { buildSessionContext } = await import(path.join(PI_ROOT, "dist/core/session-manager.js"));
 
 // ---- fake pi ------------------------------------------------------------
 const handlers = {};
@@ -820,7 +821,10 @@ const prior = {
 	type: "compaction", id: "prior-checkpoint", parentId: recoveryBranch[15].id,
 	timestamp: new Date(16).toISOString(), summary: "Previous checkpoint", firstKeptEntryId: recoveryBranch[8].id, tokensBefore: 20000,
 };
-const repeatedBranch = [...recoveryBranch.slice(0, 16), prior, ...recoveryBranch.slice(16)];
+const repeatedBranch = [
+	...recoveryBranch.slice(0, 16), prior,
+	{ ...recoveryBranch[16], parentId: prior.id }, ...recoveryBranch.slice(17),
+];
 const repeatedPrep = prepareCompaction(repeatedBranch, recoverySettings);
 const repeatedNext = prepareCompaction(repeatedBranch, { ...recoverySettings, keepRecentTokens: 16384 });
 const repeatedSummary = { role: "compactionSummary", summary: prior.summary, tokensBefore: prior.tokensBefore, timestamp: 16 };
@@ -910,5 +914,50 @@ for (const phase of ["auth", "response-json", "error-body"]) {
 	assert.equal(fetchCalls.length, phase === "auth" ? 0 : 1, `abort during ${phase} must not send another request`);
 }
 console.log("ok: AG: cancellation during auth, successful response parsing, and error body stops requests/checkpoints");
+
+// Canonical preparation remains usable after edits; only raw cut retries are disabled.
+for (const anthropic of [false, true]) {
+	const currentModel = { ...(anthropic ? anthropicModel : model), maxTokens: 64000 };
+	const current = { ...ctx, model: currentModel };
+	for (const target of [4, 44]) {
+		for (const replacement of [null, { content: "REPLACED user context" }]) {
+			const editedBranch = [...recoveryBranch, {
+				type: "context_edit", id: "edit", parentId: recoveryBranch.at(-1).id,
+				timestamp: new Date(100).toISOString(), targetId: recoveryBranch[target].id, replacement,
+			}];
+			const projected = buildSessionContext(editedBranch).messages;
+			const preparation = prepareCompaction(editedBranch, recoverySettings);
+			const payload = { ...(anthropic ? anthropicPayload : openaiPayload), messages: historyWire(projected, currentModel) };
+			const event = compactEvent({ preparation, branchEntries: editedBranch });
+			const original = structuredClone({ branch: editedBranch, preparation, payload });
+			const success = () => okJson(anthropic
+				? { content: [{ type: "text", text: "Edited summary" }], stop_reason: "end_turn" }
+				: { choices: [{ message: { content: "Edited summary" }, finish_reason: "stop" }] });
+			capture(current, { payload, contextMessages: projected });
+			fetchCalls.length = 0;
+			responseQueue = [success()];
+			result = await handlers.session_before_compact[0](event, current);
+			assert.equal(result?.compaction?.summary, "Edited summary", "first attempt uses canonical preparation");
+			assert.equal(result.compaction.firstKeptEntryId, preparation.firstKeptEntryId);
+			assert.equal(fetchCalls.length, 1);
+
+			for (const failure of [
+				okJson(anthropic
+					? { content: [{ type: "text", text: "Partial" }], stop_reason: "max_tokens" }
+					: { choices: [{ message: { content: "Partial" }, finish_reason: "length" }] }),
+				bad(400, '{"error":{"code":"context_length_exceeded"}}'),
+			]) {
+				fetchCalls.length = 0;
+				responseQueue = [failure, success()];
+				result = await handlers.session_before_compact[0](event, current);
+				assert.equal(result, undefined, "edited-context limit recovery yields to native");
+				assert.equal(fetchCalls.length, 1, "no raw-entry retry is sent");
+				assert.equal(responseQueue.length, 1);
+			}
+			assert.deepEqual({ branch: editedBranch, preparation, payload }, original);
+		}
+	}
+	console.log(`ok: AH: ${currentModel.api}: omitted/replaced prefix/tail, successful first attempt, native limit fallback, immutable history`);
+}
 
 console.log(process.exitCode ? "\nSOME TESTS FAILED" : "\nALL TESTS PASSED");

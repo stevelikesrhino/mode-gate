@@ -13,7 +13,6 @@ const jiti = createJiti(path.join(root, "dist/index.js"), {
 });
 const factory = await jiti.import(fileURLToPath(new URL("../index.ts", import.meta.url)), { default: true });
 const native = await jiti.import(fileURLToPath(new URL("../codex/native-compaction.ts", import.meta.url)));
-const { registerCodexCompaction, needsLegacyCompactionFallback } = await jiti.import(fileURLToPath(new URL("../codex/extension.ts", import.meta.url)));
 
 const handlers = {};
 const renderers = {};
@@ -99,7 +98,8 @@ assert.equal(calls[0].init.headers.get("chatgpt-account-id"), "test-account");
 
 // Replay old-package checkpoint entries, including local-marker suppression.
 const checkpoint = { ...result.compaction, type: "compaction", id: "cp", parentId: "tail", timestamp: "2026-09-07T00:01:00Z" };
-branch = [...branch, checkpoint, entry("after", "cp", { ...userNext, content: "What token did I ask you to remember?" })];
+const checkpointBranch = [...branch, checkpoint];
+branch = [...checkpointBranch, entry("after", "cp", { ...userNext, content: "What token did I ask you to remember?" })];
 const marker = { role: "compactionSummary", summary: checkpoint.summary, tokensBefore: 50000, timestamp: 4 };
 assert.deepEqual(await context([marker, userNext]), [userNext]);
 captured = await capture({ ...originalPayload, previous_response_id: "stale" }, ctx, [marker, userNext]);
@@ -111,9 +111,121 @@ respond = sse;
 result = await compact();
 assert.equal(result.compaction.details.replacementHistory.filter((item) => item.type === "compaction").length, 1, "repeat compaction replaces opaque checkpoint");
 
+// Pi 0.87 context edits must remain authoritative after an opaque checkpoint.
+const editable = entry("editable", "cp", { ...userNext, content: "ORIGINAL TAIL CONTENT" });
+const omission = {
+	type: "context_edit", id: "omit-editable", parentId: "editable", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "editable", replacement: null,
+};
+let replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, editable, omission], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("ORIGINAL TAIL CONTENT"), false, "post-checkpoint omission is applied to Codex replay");
+assert.deepEqual(replayInput, checkpoint.details.replacementHistory, "omitted tail contributes no replacement items");
+const uneditedBranchInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, editable], model, tools: [] });
+assert.equal(JSON.stringify(uneditedBranchInput).includes("ORIGINAL TAIL CONTENT"), true, "context edits remain branch-relative");
+
+const noCheckpointEditable = entry("no-checkpoint-editable", null, { ...userNext, content: "NO CHECKPOINT ORIGINAL" });
+const noCheckpointOmission = {
+	type: "context_edit", id: "omit-no-checkpoint", parentId: "no-checkpoint-editable", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "no-checkpoint-editable", replacement: null,
+};
+assert.deepEqual(
+	native.effectiveInputForBranch({ branch: [noCheckpointEditable, noCheckpointOmission], model, tools: [] }),
+	[],
+	"canonical projection also applies edits before any checkpoint exists",
+);
+
+const failedAttempt = entry("failed-attempt", "cp", {
+	...assistant,
+	content: [{ type: "text", text: "ABANDONED LENGTH RESPONSE" }],
+	stopReason: "length",
+});
+const recoveryOmission = {
+	type: "context_edit", id: "omit-failed-attempt", parentId: "failed-attempt", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "failed-attempt", replacement: null,
+};
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, failedAttempt, recoveryOmission], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("ABANDONED LENGTH RESPONSE"), false, "0.87 recovery omission replaces the legacy last-assistant filter");
+assert.deepEqual(replayInput, checkpoint.details.replacementHistory, "omitted length attempt contributes no replacement items");
+
+const replacement = {
+	type: "context_edit", id: "replace-editable", parentId: "editable", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "editable", replacement: { content: "REPLACED TAIL CONTENT" },
+};
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, editable, replacement], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("ORIGINAL TAIL CONTENT"), false, "post-checkpoint replacement removes original content");
+assert.equal(JSON.stringify(replayInput).includes("REPLACED TAIL CONTENT"), true, "post-checkpoint replacement reaches Codex replay");
+const latestReplacement = {
+	...replacement,
+	id: "replace-editable-again",
+	parentId: "replace-editable",
+	replacement: { content: "LATEST TAIL CONTENT" },
+};
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, editable, replacement, latestReplacement], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("REPLACED TAIL CONTENT"), false, "superseded context replacement is not replayed");
+assert.equal(JSON.stringify(replayInput).includes("LATEST TAIL CONTENT"), true, "latest context replacement wins");
+
+const toolCall = entry("tool-call", "cp", {
+	...assistant,
+	content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "true" } }],
+	stopReason: "toolUse",
+});
+const toolResult = entry("tool-result", "tool-call", {
+	role: "toolResult", toolCallId: "call-1", toolName: "bash",
+	content: [{ type: "text", text: "ORIGINAL TOOL RESULT" }], isError: false, timestamp: 4,
+});
+const replaceToolResult = {
+	type: "context_edit", id: "replace-tool-result", parentId: "tool-result", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "tool-result", replacement: { content: "REPLACED TOOL RESULT" },
+};
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, toolCall, toolResult, replaceToolResult], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("ORIGINAL TOOL RESULT"), false, "tool-result replacement removes original output");
+assert.equal(replayInput.find((item) => item.type === "function_call_output")?.output, "REPLACED TOOL RESULT", "tool-result replacement is normalized for Codex replay");
+const omitToolResult = { ...replaceToolResult, id: "omit-tool-result", replacement: null };
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch, toolCall, toolResult, omitToolResult], model, tools: [] });
+assert.equal(JSON.stringify(replayInput).includes("ORIGINAL TOOL RESULT"), false, "tool-result omission removes original output");
+assert.equal(replayInput.find((item) => item.type === "function_call_output")?.output, "No result provided", "omitted tool result preserves a valid orphan-call placeholder");
+
+const preCheckpointEdit = {
+	type: "context_edit", id: "pre-checkpoint-edit", parentId: "tail", timestamp: "2026-09-07T00:00:30Z",
+	targetId: "u", replacement: null,
+};
+const checkpointAfterEdit = { ...checkpoint, parentId: "pre-checkpoint-edit" };
+assert.doesNotThrow(
+	() => native.effectiveInputForBranch({ branch: [...checkpointBranch.slice(0, -1), preCheckpointEdit, checkpointAfterEdit], model, tools: [] }),
+	"an edit already baked into an opaque checkpoint does not block replay",
+);
+const legacyCustomCheckpoint = {
+	type: "custom", id: "legacy-custom-checkpoint", parentId: "tail", timestamp: "2026-09-07T00:01:00Z",
+	customType: native.NATIVE_COMPACTION_KIND, data: checkpoint.details,
+};
+const customTail = entry("custom-tail", "legacy-custom-checkpoint", { ...userNext, content: "TAIL AFTER CUSTOM CHECKPOINT" });
+replayInput = native.effectiveInputForBranch({ branch: [...checkpointBranch.slice(0, -1), legacyCustomCheckpoint, customTail], model, tools: [] });
+assert.equal(replayInput.filter((item) => item.type === "compaction").length, 1, "old custom checkpoint format still replays its opaque item");
+assert.equal(JSON.stringify(replayInput).includes("TAIL AFTER CUSTOM CHECKPOINT"), true, "old custom checkpoint format retains its canonical tail");
+
+const opaqueEdit = {
+	type: "context_edit", id: "edit-opaque", parentId: "cp", timestamp: "2026-09-07T00:02:00Z",
+	targetId: "u", replacement: null,
+};
+assert.throws(
+	() => native.effectiveInputForBranch({ branch: [...checkpointBranch, opaqueEdit], model, tools: [] }),
+	/history inside the latest OpenAI Codex native compaction checkpoint/,
+	"an edit targeting opaque pre-checkpoint history fails closed",
+);
+branch = [...checkpointBranch, opaqueEdit];
+const beforeOpaqueAbort = aborted;
+captured = await capture(originalPayload, ctx, [marker, userNext]);
+assert.deepEqual(captured.payload.input, [], "opaque-history edit blocks the outgoing Codex request");
+assert.equal(aborted, beforeOpaqueAbort + 1, "opaque-history edit aborts the active request");
+const beforeOpaqueCompaction = calls.length;
+assert.deepEqual(await compact(), { cancel: true }, "opaque-history edit also cancels checkpoint replacement");
+assert.equal(calls.length, beforeOpaqueCompaction, "opaque-history edit fails before compaction network I/O");
+branch = [...checkpointBranch, entry("after", "cp", { ...userNext, content: "What token did I ask you to remember?" })];
+
 const differentModel = { ...ctx, model: { ...model, id: "other-codex-model" } };
+const beforeWrongModelAbort = aborted;
 await capture(originalPayload, differentModel, [marker, userNext]);
-assert.equal(aborted, 1, "wrong-model opaque checkpoint blocks continuation");
+assert.equal(aborted, beforeWrongModelAbort + 1, "wrong-model opaque checkpoint blocks continuation");
 const beforeFailure = calls.length;
 result = await handlers.session_before_compact[0](compactEvent(), differentModel);
 assert.deepEqual(result, { cancel: true });
@@ -159,11 +271,6 @@ for (const api of ["openai-completions", "openai-responses"]) {
 }
 assert.equal(calls.length, beforeExcluded);
 assert.equal(authCalls, beforeAuth);
-assert.equal(needsLegacyCompactionFallback("0.84.3"), true);
-assert.equal(needsLegacyCompactionFallback("0.84.4"), false);
-const legacyEvents = [];
-assert.equal(typeof registerCodexCompaction({ ...pi, on: (name) => legacyEvents.push(name) }, "0.84.3"), "function");
-assert.ok(legacyEvents.includes("turn_end") && legacyEvents.includes("agent_settled"));
 assert.equal(native.findNativeCheckpoint([checkpoint]).status, "valid");
 const malformedBranch = [{ ...checkpoint, details: { ...checkpoint.details, replacementHistory: [] } }];
 branch = malformedBranch;

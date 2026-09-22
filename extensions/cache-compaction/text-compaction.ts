@@ -159,6 +159,9 @@ function isContextLimitError(status: number, text: string, model: NonNullable<Ex
 
 function prepareRetry(event: SessionBeforeCompactEvent, keepRecentTokens: number): SessionBeforeCompactEvent["preparation"] | undefined {
 	const entries = event.branchEntries;
+	// Pi's public cut selector reads raw entries, not the edited projection.
+	// Leave edit-aware limit recovery to native compaction.
+	if (entries.some((entry) => entry.type === "context_edit")) return undefined;
 	const previousIndex = entries.findLastIndex((entry) => entry.type === "compaction");
 	const previous = entries[previousIndex];
 	const keptIndex = previous?.type === "compaction" ? entries.findIndex((entry) => entry.id === previous.firstKeptEntryId) : -1;

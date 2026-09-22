@@ -1,9 +1,8 @@
-import { complete, type Message, type Tool } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, getCurrentSystemPrompt, type Context, type Message, type Tool } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
-	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 import { readFile, rename, writeFile } from "node:fs/promises";
@@ -86,6 +85,50 @@ function isHandoffEntry(entry: SessionEntry | undefined): entry is HandoffEntry 
 	return entry?.type === "custom_message" && entry.customType === "handoff";
 }
 
+function activeToolDeclarations(pi: ExtensionAPI): Tool[] {
+	const toolsByName = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+	return pi.getActiveTools().flatMap((name) => {
+		const tool = toolsByName.get(name);
+		return tool ? [{ name: tool.name, description: tool.description, parameters: tool.parameters }] : [];
+	});
+}
+
+function buildHandoffContext(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	messages: Message[],
+): Context {
+	const effectivePrompt = ctx.getSystemPrompt();
+	const hasSystemMessage = messages.some((message) => message.role === "system");
+
+	// Sessions created before prompt checkpoints need the current prompt and tool
+	// loadout declared once, just as they were before transcript-backed prompts.
+	if (!hasSystemMessage) {
+		return {
+			systemPrompt: effectivePrompt,
+			messages,
+			tools: activeToolDeclarations(pi),
+		};
+	}
+
+	if (effectivePrompt === getCurrentSystemPrompt(messages)) return { messages };
+
+	// Match Pi's request-time prompt projection when the current effective prompt
+	// differs from the last prompt recorded in the transcript.
+	const current = getCurrentSystemMessage(messages);
+	return {
+		messages: [
+			{
+				role: "system",
+				content: effectivePrompt,
+				...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
+				timestamp: current?.timestamp ?? Date.now(),
+			},
+			...messages.filter((message) => message.role !== "system"),
+		],
+	};
+}
+
 async function pruneOrphanHandoffLeaves(sessionFile: string, activeBranchIds: Set<string>): Promise<number> {
 	let content: string;
 	try {
@@ -144,47 +187,38 @@ export default function handoffExtension(pi: ExtensionAPI): void {
 				showHandoffLoader(ctx);
 
 				const model = ctx.model!;
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-				if (!auth.ok) throw new Error(auth.error);
-
-				const agentMessages = ctx.sessionManager
-					.buildContextEntries()
-					.flatMap(sessionEntryToContextMessages);
-				if (agentMessages.length === 0) {
+				const agentMessages = ctx.sessionManager.buildSessionProjection().messages;
+				if (!agentMessages.some((message) => message.role !== "system")) {
 					ctx.ui.notify("No conversation to hand off", "warning");
 					return;
 				}
 
-				const activeToolNames = pi.getActiveTools();
-				const toolsByName = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-				const tools: Tool[] = activeToolNames.map((name) => {
-					const tool = toolsByName.get(name)!;
-					return { name: tool.name, description: tool.description, parameters: tool.parameters };
-				});
 				const handoffInstruction: Message = {
 					role: "user",
 					content: [{ type: "text", text: COMPACTION_PROMPT }],
 					timestamp: Date.now(),
 				};
+				const context = buildHandoffContext(pi, ctx, [
+					...convertToLlm(agentMessages),
+					handoffInstruction,
+				]);
 				const thinkingLevel = pi.getThinkingLevel();
-				const response = await complete(
+				const response = await ctx.modelRegistry.streamSimple(
 					model,
+					context,
 					{
-						systemPrompt: ctx.getSystemPrompt(),
-						messages: [...convertToLlm(agentMessages), handoffInstruction],
-						tools,
-					},
-					{
-						apiKey: auth.apiKey,
-						headers: auth.headers,
-						env: auth.env,
 						maxTokens: 8192,
 						reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
 						sessionId: ctx.sessionManager.getSessionId(),
 					},
-				);
-				if (response.stopReason === "error") {
-					throw new Error(response.errorMessage ?? "Handoff summarization failed");
+				).result();
+				if (response.stopReason !== "stop") {
+					throw new Error(
+						response.errorMessage ?? `Handoff summarization did not finish: ${response.stopReason}`,
+					);
+				}
+				if (response.content.some((part) => part.type === "toolCall")) {
+					throw new Error("Handoff summarization attempted to call a tool");
 				}
 
 				const summary = response.content
