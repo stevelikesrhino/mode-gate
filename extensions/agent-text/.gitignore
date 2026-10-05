@@ -1,1 +1,3 @@
 node_modules/
+claude-mod/.claude-plugin/types/
+claude-mod/tsconfig.json

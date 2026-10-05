@@ -11,6 +11,8 @@ type OwnerRecord = {
 	messagingSocketPath: string;
 	spare?: boolean;
 	parkedJobId?: string;
+	name?: unknown;
+	nameSource?: unknown;
 };
 
 function registryDirectory(): string {
@@ -31,12 +33,14 @@ async function readOwner(pid: number): Promise<OwnerRecord> {
 	return record;
 }
 
-export async function ownerInfo(pid: number, inbox: string): Promise<{ reason?: string; jobId?: string }> {
+export async function ownerInfo(pid: number, inbox: string): Promise<{ reason?: string; jobId?: string; name?: string }> {
 	try {
 		const record = await readOwner(pid);
 		if (record.messagingSocketPath !== inbox) return { reason: "Claude owner record does not match this adapter's inbox." };
 		if (record.spare === true || record.parkedJobId !== undefined) return { reason: "Claude owner is a spare worker or parked launcher." };
-		return { jobId: record.kind === "bg" ? record.jobId : undefined };
+		// Derived and unsourced names are placeholders (agent-12, a job ID), not session titles.
+		const named = typeof record.name === "string" && !!record.name && typeof record.nameSource === "string" && record.nameSource !== "derived";
+		return { jobId: record.kind === "bg" ? record.jobId : undefined, name: named ? (record.name as string).slice(0, 120) : undefined };
 	} catch {
 		return { reason: "Claude owner record is missing, unreadable, or incompatible. Run /agent-text setup-claude in Pi to check compatibility." };
 	}
