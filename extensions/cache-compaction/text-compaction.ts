@@ -399,12 +399,14 @@ function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 // Map only serialization shapes we can verify without rebuilding the payload.
-// Unknown insertions, omissions, normalized tool IDs, and image side messages
-// fall back rather than risking a cut that includes retained history.
+// Unknown insertions, omissions, and image side messages fall back rather than
+// risking a cut that includes retained history. Providers may normalize foreign
+// tool IDs, so IDs only need a consistent one-to-one mapping within each turn.
 function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObject[], count: number, anthropic: boolean): number | undefined {
 	let wire = !anthropic && (messages[0]?.role === "system" || messages[0]?.role === "developer") ? 1 : 0;
 	let cut: number | undefined;
-	const pending = new Set<string>();
+	// Context tool call ID -> serialized ID for the open tool turn.
+	const pending = new Map<string, string>();
 	for (let i = 0; i < context.length;) {
 		const msg = context[i];
 		const sent = messages[wire];
@@ -420,9 +422,10 @@ function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObj
 			const sentIds = anthropic
 				? (Array.isArray(sent.content) ? sent.content.filter((b: any) => b.type === "tool_result").map((b: any) => b.tool_use_id) : [])
 				: [sent.tool_call_id];
-			if (sent.role !== (anthropic ? "user" : "tool") || !deepEqual(ids, sentIds)) return undefined;
-			for (const id of ids) {
-				if (!pending.delete(id)) return undefined;
+			if (sent.role !== (anthropic ? "user" : "tool") || sentIds.length !== ids.length) return undefined;
+			for (const [k, id] of ids.entries()) {
+				if (!pending.has(id) || pending.get(id) !== sentIds[k]) return undefined;
+				pending.delete(id);
 			}
 			i += results.length;
 		} else {
@@ -433,8 +436,9 @@ function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObj
 				const sentIds = anthropic
 					? (Array.isArray(sent.content) ? sent.content.filter((b: any) => b.type === "tool_use").map((b: any) => b.id) : [])
 					: (sent.tool_calls ?? []).map((b: any) => b.id);
-				if (!deepEqual(ids, sentIds)) return undefined;
-				for (const id of ids) pending.add(id);
+				if (ids.length !== sentIds.length || sentIds.some((id: unknown) => typeof id !== "string") ||
+					new Set(ids).size !== ids.length || new Set(sentIds).size !== sentIds.length) return undefined;
+				for (const [k, id] of ids.entries()) pending.set(id, sentIds[k]);
 			}
 			i++;
 		}

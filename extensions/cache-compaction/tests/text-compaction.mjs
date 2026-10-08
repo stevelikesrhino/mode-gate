@@ -1176,4 +1176,40 @@ for (const duringCompletion of [false, true]) {
 }
 console.log("ok: AL: Responses SDK cancellation before serialization and at response.completed never creates a checkpoint");
 
+// AM: Foreign Responses tool IDs normalized by the actual Completions serializer.
+const { streamSimple: completionsStreamSimple } = await import(path.join(PI_ROOT, "node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js"));
+const deepseekModel = { ...model, provider: "deepseek", id: "deepseek-flash", baseUrl: "https://api.deepseek.com/" };
+const deepseekCtx = { ...ctx, model: deepseekModel, sessionManager: { getSessionId: () => "foreign-ids" } };
+const foreignId = "call_Gn8b5qxDboTDNxxd0Jg7ATHo|fc_055258f1112c1a9a016ac66c407fixture";
+const foreignAssistant = { ...assistantMsg, provider: "openai", api: "openai-responses", model: "gpt-6.1-sol",
+	content: [{ type: "toolCall", id: foreignId, name: "bash", arguments: { command: "ls" } }], stopReason: "toolUse" };
+const foreignResult = { role: "toolResult", toolCallId: foreignId, toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 };
+const foreignContext = [userMsg, foreignAssistant, foreignResult, assistantMsg, userNextCtx];
+let foreignPayload;
+await completionsStreamSimple(deepseekModel, { systemPrompt: "SYS", messages: structuredClone(foreignContext) }, { apiKey: "serializer-fixture", maxRetries: 0,
+	onPayload: value => { foreignPayload = structuredClone(value); throw new Error("serialization-only fixture"); },
+}).result();
+const wireCallId = foreignPayload.messages.find(message => message.tool_calls)?.tool_calls[0].id;
+assert.ok(wireCallId && wireCallId !== foreignId, "Actual serializer normalizes the foreign pipe ID");
+assert.equal(foreignPayload.messages.find(message => message.role === "tool").tool_call_id, wireCallId);
+const foreignEvent = () => compactEvent({ preparation: { messagesToSummarize: [userMsg, foreignAssistant, foreignResult, assistantMsg] } });
+capture(deepseekCtx, { payload: foreignPayload, contextMessages: foreignContext });
+fetchCalls.length = 0;
+responseQueue = [okJson({ choices: [{ message: { content: "foreign summary" }, finish_reason: "stop" }] })];
+result = await handlers.session_before_compact[0](foreignEvent(), deepseekCtx);
+must(result?.compaction?.summary === "foreign summary", "AM: normalized foreign tool IDs use cache-aligned compaction");
+body = JSON.parse(fetchCalls.at(-1).init.body);
+must(JSON.stringify(body.messages.slice(0, -1)) === JSON.stringify(foreignPayload.messages.slice(0, -1)), "AM: captured normalized prefix replayed unchanged");
+for (const [name, mutate] of [
+	["result mapped to another call", payload => { payload.messages.find(message => message.role === "tool").tool_call_id = "call_other"; }],
+	["missing serialized call ID", payload => { delete payload.messages.find(message => message.tool_calls).tool_calls[0].id; }],
+]) {
+	const payload = structuredClone(foreignPayload);
+	mutate(payload);
+	capture(deepseekCtx, { payload, contextMessages: foreignContext });
+	fetchCalls.length = 0;
+	result = await handlers.session_before_compact[0](foreignEvent(), deepseekCtx);
+	must(result === undefined && fetchCalls.length === 0, `AM: ${name} falls back before network`);
+}
+
 console.log(process.exitCode ? "\nSOME TESTS FAILED" : "\nALL TESTS PASSED");
