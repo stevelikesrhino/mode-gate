@@ -282,4 +282,17 @@ const missingAuth = { ...ctx, modelRegistry: { getApiKeyAndHeaders: async () => 
 assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), missingAuth), { cancel: true });
 assert.equal(calls.length, beforeMalformed, "Codex auth failure cannot fall through to text");
 assert.equal(native.findNativeCheckpoint([{ ...checkpoint, details: { ...checkpoint.details, replacementHistory: [] } }]).status, "invalid");
-console.log("Combined dispatcher, Codex replay/failure, provider isolation, and branch-summary tests passed.");
+// A legacy opaque checkpoint cannot become an ordinary public text summary.
+const publicCtx = { ...ctx, model: { ...model, provider: "openai", api: "openai-responses", baseUrl: "https://api.openai.com/v1" },
+	hasUI: true, ui: { notify() { throw new Error("fixture UI failure"); } } };
+for (const oldCheckpoint of [checkpoint, { ...checkpoint, details: { ...checkpoint.details, replacementHistory: [] } }]) {
+	branch = [...regularBranch, oldCheckpoint];
+	const beforeAbort = aborted;
+	const beforeNetwork = calls.length;
+	captured = await capture({ model: model.id, input: [{ role: "user", content: "Continue" }] }, publicCtx, [marker, userNext]);
+	assert.deepEqual(captured.payload.input, []);
+	assert.equal(aborted, beforeAbort + 1, "Opaque model switch remains blocked even if notification fails");
+	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), publicCtx), { cancel: true });
+	assert.equal(calls.length, beforeNetwork, "Opaque history never reaches the public text path");
+}
+console.log("Combined dispatcher, Codex replay/failure, public opaque guard, provider isolation, and branch-summary tests passed.");

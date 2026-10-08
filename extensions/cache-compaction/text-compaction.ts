@@ -11,10 +11,9 @@
  * still depend on provider-side serialization and cache availability.
  *
  * Scope:
- * - openai and openai-codex providers are excluded; their compaction is owned
- *   by other extensions or pi's native fallback.
+ * - Legacy openai-codex compaction remains owned by its checkpoint reader.
  * - Branch summarization stays native; no tree-navigation hooks are installed.
- * - Only openai-completions and anthropic-messages payload shapes are handled;
+ * - openai-completions, openai-responses, and anthropic-messages are supported;
  *   anything else falls back to pi's native compaction.
  *
  * Limit failures retry with doubled recent-history retention and a shorter
@@ -197,6 +196,8 @@ function addUsage(total: Usage | undefined, next: Usage | undefined): Usage | un
 		cacheRead: total.cacheRead + next.cacheRead,
 		cacheWrite: total.cacheWrite + next.cacheWrite,
 		totalTokens: total.totalTokens + next.totalTokens,
+		...(total.reasoning !== undefined || next.reasoning !== undefined
+			? { reasoning: (total.reasoning ?? 0) + (next.reasoning ?? 0) } : {}),
 		cost: {
 			input: total.cost.input + next.cost.input,
 			output: total.cost.output + next.cost.output,
@@ -217,12 +218,15 @@ interface CapturedRequest {
 	// event. Used to prove prefix identity after omitting failed assistants
 	// that pi's provider serializers do not replay.
 	contextMessages: unknown[] | undefined;
+	// Responses can emit several wire items per assistant and inline prompt/tool
+	// updates. Keep the full transcript for SDK-verified prefix serialization.
+	fullContextMessages?: unknown[];
 }
 
 const capturedBySession = new Map<string, CapturedRequest>();
 
 function isExcludedProvider(model: { provider: string }): boolean {
-	return model.provider === "openai" || model.provider === "openai-codex";
+	return model.provider === "openai-codex";
 }
 
 function modelKey(model: { provider: string; api: string; id: string }): string {
@@ -440,6 +444,104 @@ function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObj
 	return wire === messages.length ? cut : undefined;
 }
 
+async function summarizeResponses(ctx: ExtensionContext, captured: CapturedRequest, count: number, instruction: string, maxTokens: number, signal: AbortSignal): Promise<{ text: string; usage: Usage }> {
+	const model = ctx.model!;
+	const payload = captured.payload!;
+	const input = payload.input;
+	const knownTypes = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "additional_tools", "tool_search_call", "tool_search_output"]);
+	// External/opaque history cannot be proven from this local transcript.
+	if (payload.previous_response_id !== undefined || payload.conversation !== undefined || payload.context_management !== undefined ||
+		!Array.isArray(input) || input.some((item) => !isJsonObject(item) ||
+			(item.type !== undefined ? !knownTypes.has(item.type) : !["user", "assistant", "system", "developer"].includes(item.role)))) {
+		throw new Error("Responses history cannot be verified for cache-aligned compaction");
+	}
+	if (payload.tool_choice !== undefined && payload.tool_choice !== "auto" && payload.tool_choice !== "none") {
+		throw new Error("summary requires an unforced tool choice");
+	}
+	const full = captured.fullContextMessages?.filter((message) => !isOmittedAssistant(message));
+	const visible = (messages: unknown[]) => messages.filter((message) => !(isJsonObject(message) && message.role === "system"));
+	if (!full || !deepEqual(visible(full), visible(captured.contextMessages!.filter((message) => !isOmittedAssistant(message))))) {
+		throw new Error("Responses full transcript does not match the captured conversation");
+	}
+	const prefix: unknown[] = [];
+	let seen = 0;
+	for (const message of full) {
+		if (seen === count) break;
+		prefix.push(message);
+		if (!(isJsonObject(message) && message.role === "system")) seen++;
+	}
+	const context = { messages: convertToLlm(prefix as Parameters<typeof convertToLlm>[0]) };
+	// SDK orphan repair can add a synthetic result. Never let it consume a real
+	// retained result that happens to contain the same text at the cut point.
+	const pending = new Set<string>();
+	for (const message of context.messages) {
+		if (message.role === "system") continue;
+		if (message.role === "toolResult") {
+			if (!pending.delete(message.toolCallId)) throw new Error("unpaired tool result at summary boundary");
+		} else {
+			if (pending.size) throw new Error("unfinished tool turn at summary boundary");
+			if (message.role === "assistant") {
+				for (const block of message.content) {
+					if (block.type !== "toolCall") continue;
+					if (pending.has(block.id)) throw new Error("duplicate tool call at summary boundary");
+					pending.add(block.id);
+				}
+			}
+		}
+	}
+	if (pending.size) throw new Error("unfinished tool turn at summary boundary");
+	const headers: Record<string, string> = {};
+	for (const [key, value] of Object.entries(captured.headers!)) {
+		// Current provider credentials are resolved by the registry, not replayed
+		// from a potentially stale captured Authorization header.
+		if (["authorization", "x-api-key", "content-length", "content-type", "accept"].includes(key.toLowerCase())) continue;
+		headers[key] = value;
+	}
+	let invalidOutput = false;
+	const checkOutput = (item: unknown): void => {
+		if (!isJsonObject(item) || !["message", "reasoning"].includes(item.type) ||
+			(item.type === "message" && Array.isArray(item.content) && item.content.some((block: any) => block?.type !== "output_text"))) invalidOutput = true;
+	};
+	signal.throwIfAborted();
+	const result = await ctx.modelRegistry.streamSimple(model, context, {
+		signal, maxTokens, headers, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: MAX_ATTEMPTS - 1,
+		sessionId: ctx.sessionManager.getSessionId(), transport: "sse",
+		onPayload: (generated) => {
+			signal.throwIfAborted();
+			// Use the same SDK serializer to prove the cut, then send the original
+			// captured items, not the reserialized copies. Unknown transforms yield
+			// to native compaction before any HTTP request is made.
+			if (!isJsonObject(generated) || !Array.isArray(generated.input) || generated.input.length === 0 ||
+				!deepEqual(generated.input, input.slice(0, generated.input.length))) {
+				throw new Error("Responses wire prefix does not match the compaction boundary");
+			}
+			const body: JsonObject = { ...payload, input: [...input.slice(0, generated.input.length), { role: "user", content: instruction }], stream: true, store: false };
+			// The SDK omits unsupported output caps for ChatGPT token sharing.
+			// Do not restore a captured one-token cap or invent an OAuth hard limit.
+			if (generated.max_output_tokens !== undefined) body.max_output_tokens = generated.max_output_tokens;
+			else delete body.max_output_tokens;
+			log({ ev: "request", api: model.api, cutIndex: generated.input.length, payloadMsgCount: input.length, bodyMsgCount: body.input.length, maxTokens: body.max_output_tokens });
+			return body;
+		},
+		onProviderStreamEvent: (data) => {
+			if (!isJsonObject(data)) return;
+			if (typeof data.type === "string" && data.type.startsWith("response.refusal.")) invalidOutput = true;
+			if (data.type === "response.output_item.added" || data.type === "response.output_item.done") checkOutput(data.item);
+			if (Array.isArray(data.response?.output)) data.response.output.forEach(checkOutput);
+		},
+	}).result();
+	signal.throwIfAborted();
+	log({ ev: "usage", usage: result.usage });
+	if (invalidOutput || result.content.some((block) => block.type === "toolCall")) throw new Error("summary emitted a tool call, refusal, or unsupported output");
+	if (result.stopReason === "length" || isContextOverflow(result, model.contextWindow)) {
+		throw new CompactionLimitError(`summary reached limit: ${result.rawStopReason ?? result.stopReason}`, result.usage);
+	}
+	if (result.stopReason !== "stop" || result.rawStopReason !== "completed") throw new Error(result.errorMessage ?? `summary did not finish normally: ${result.rawStopReason ?? result.stopReason}`);
+	const text = stripCodeFences(result.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
+	if (!text) throw new Error("empty summary");
+	return { text, usage: result.usage };
+}
+
 export default function registerTextCompaction(pi: ExtensionAPI) {
 	// Fires once per provider request, before convertToLlm and before the
 	// payload is built: the agent context messages this request will be based
@@ -461,6 +563,16 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		return undefined;
 	});
 
+	pi.on("context_with_system", (event, ctx) => {
+		const existing = capturedBySession.get(ctx.sessionManager.getSessionId());
+		if (ctx.model?.api !== "openai-responses" || !existing || existing.modelKey !== modelKey(ctx.model)) return;
+		try {
+			existing.fullContextMessages = structuredClone(event.messages);
+		} catch {
+			existing.fullContextMessages = undefined;
+		}
+	});
+
 	pi.on("before_provider_request", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const existing = capturedBySession.get(sessionId);
@@ -478,7 +590,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			ev: "capture",
 			session: sessionId.slice(0, 8),
 			model: modelKey(ctx.model),
-			msgCount: Array.isArray(event.payload.messages) ? event.payload.messages.length : -1,
+			msgCount: Array.isArray(event.payload.messages ?? event.payload.input) ? (event.payload.messages ?? event.payload.input).length : -1,
 		});
 		return undefined;
 	});
@@ -499,6 +611,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			payload: existing?.payload,
 			headers,
 			contextMessages: existing?.contextMessages,
+			fullContextMessages: existing?.fullContextMessages,
 		});
 	});
 
@@ -515,7 +628,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			// extensions retain ownership regardless of handler load order.
 			if (isExcludedProvider(model)) return undefined;
 			log({ ev: "compact-start", model: modelKey(model), reason: event.reason, willRetry: event.willRetry });
-			if (model.api !== "openai-completions" && model.api !== "anthropic-messages") {
+			if (model.api !== "openai-completions" && model.api !== "openai-responses" && model.api !== "anthropic-messages") {
 				log({ ev: "fallback", stage: "unsupported-api", api: model.api });
 				return undefined;
 			}
@@ -544,7 +657,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			}
 
 			const payload = captured.payload;
-			const messages = payload.messages;
+			const messages = model.api === "openai-responses" ? payload.input : payload.messages;
 			if (!Array.isArray(messages)) {
 				log({ ev: "fallback", stage: "no-messages-field" });
 				return undefined;
@@ -580,6 +693,24 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 					log({ ev: "fallback", stage: "context-mismatch", firstDivergence: i });
 					return undefined;
 				}
+			}
+
+			if (model.api === "openai-responses") {
+				// A policy changed after capture must not replay disabled images.
+				// Registry streams bypass Pi's Agent-level image filtering; yielding
+				// to native is safer than rewriting and invalidating the cached prefix.
+				if (pi.getSettings().images?.blockImages && messages.some((item) =>
+					[item?.content, item?.output].some((blocks) => Array.isArray(blocks) && blocks.some((block) => block?.type === "input_image")))) {
+					log({ ev: "fallback", stage: "blocked-images" });
+					return undefined;
+				}
+				const maxTokens = Math.max(1, Math.min(Math.max(8192, prep.settings.keepRecentTokens, prep.settings.reserveTokens), model.maxTokens > 0 ? model.maxTokens : Infinity));
+				const { text, usage } = await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), maxTokens, event.signal);
+				log({ ev: "compact-ok", summaryChars: text.length, usage });
+				return { compaction: {
+					summary: text, firstKeptEntryId: prep.firstKeptEntryId, tokensBefore: prep.tokensBefore, usage,
+					details: { kind: "cache-aligned-compaction", version: 1 },
+				} };
 			}
 
 			const isAnthropic = model.api === "anthropic-messages";

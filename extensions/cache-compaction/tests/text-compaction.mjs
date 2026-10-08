@@ -24,7 +24,9 @@ const { buildSessionContext } = await import(path.join(PI_ROOT, "dist/core/sessi
 
 // ---- fake pi ------------------------------------------------------------
 const handlers = {};
+let currentSettings = {};
 const pi = {
+	getSettings: () => currentSettings,
 	on: (name, fn) => {
 		(handlers[name] ??= []).push(fn);
 	},
@@ -489,8 +491,8 @@ for (const finish of ["content_filter", "tool_calls", undefined]) {
 	must(result === undefined, `V: rejects non-success finish ${finish}`);
 }
 
-// Provider ownership is keyed by provider, not by the wire API shape.
-for (const provider of ["openai", "openai-codex"]) {
+// Only legacy Codex yields ownership; public OpenAI now shares text compaction.
+for (const provider of ["openai-codex"]) {
 	for (const api of ["openai-completions", "openai-responses", "openai-codex-responses", "anthropic-messages"]) {
 		let authCalls = 0;
 		const excludedCtx = {
@@ -509,7 +511,7 @@ for (const provider of ["openai", "openai-codex"]) {
 // Even a provider switch without a context event must discard stale capture.
 for (const hook of ["before_provider_headers", "before_provider_request"]) {
 	await captureOpenai();
-	const excludedCtx = { ...ctx, model: { ...model, provider: "openai" } };
+	const excludedCtx = { ...ctx, model: { ...model, provider: "openai-codex" } };
 	handlers[hook][0]({ payload: openaiPayload, headers: {} }, excludedCtx);
 	fetchCalls.length = 0;
 	result = await handlers.session_before_compact[0](compactEvent(), ctx);
@@ -959,5 +961,219 @@ for (const anthropic of [false, true]) {
 	}
 	console.log(`ok: AH: ${currentModel.api}: omitted/replaced prefix/tail, successful first attempt, native limit fallback, immutable history`);
 }
+
+// AI: Actual Responses SDK serialization and SSE parsing, with no real network.
+const { streamSimple: responsesStreamSimple } = await import(path.join(PI_ROOT, "node_modules/@earendil-works/pi-ai/dist/api/openai-responses.js"));
+const responsesModel = { ...model, provider: "openai", api: "openai-responses", id: "gpt-6-luna", baseUrl: "https://api.openai.com/v1", reasoning: true,
+	compat: { supportsMidConvoSystemMessages: true, supportsOpenAIGrammarTools: true, supportsAdditionalTools: true } };
+const grammarTool = { name: "grammar_fixture", description: "Read only", parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] }, constrainedSampling: { type: "grammar", variants: { openai_regex: ".*" } } };
+const responsesAssistant = { ...assistantMsg, provider: "openai", api: "openai-responses", model: responsesModel.id, content: [
+	{ type: "thinking", thinking: "fixture", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_fixture", summary: [], encrypted_content: "reasoning-fixture" }) },
+	{ type: "text", text: "first part" }, { type: "text", text: "second part" },
+] };
+const fullResponses = [{ role: "system", content: "Original system", toolsAdded: [grammarTool], timestamp: 0 }, userMsg, responsesAssistant, userNextCtx];
+function responseStream({ status = "completed", output, terminal = true, extra = [] } = {}) {
+	const message = { type: "message", id: "msg_summary", role: "assistant", status: "completed", content: [{ type: "output_text", text: "## Goal\nPreserve fixture", annotations: [] }] };
+	const items = output ?? [message];
+	const events = [{ type: "response.created", response: { id: "resp_fixture" } }, ...extra];
+	for (const [output_index, item] of items.entries()) {
+		events.push({ type: "response.output_item.added", output_index, item: { ...item, ...(item.type === "message" ? { content: [] } : {}) } });
+		if (item.type === "message" && item.content?.[0]?.type === "output_text") events.push({ type: "response.output_text.delta", output_index, content_index: 0, delta: item.content[0].text });
+		events.push({ type: "response.output_item.done", output_index, item });
+	}
+	if (terminal) events.push({ type: status === "incomplete" ? "response.incomplete" : "response.completed", response: { id: "resp_fixture", status,
+		...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}), output: items,
+		usage: { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 80, cache_write_tokens: 5 }, output_tokens_details: { reasoning_tokens: 2 }, total_tokens: 110 },
+	} });
+	return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+}
+function responsesContext(credential) {
+	return { ...ctx, model: responsesModel, modelRegistry: { streamSimple: (current, context, options) => responsesStreamSimple(current, context, { ...options, apiKey: credential }) } };
+}
+async function captureResponses(current, full = fullResponses, mutate = () => {}) {
+	let payload;
+	const before = fetchCalls.length;
+	// Capture the real SDK serializer's payload without allowing its probe to fetch.
+	await responsesStreamSimple(current.model, { messages: full }, { apiKey: "sk-serializer-fixture", maxTokens: 1, maxRetries: 0,
+		onPayload: value => { payload = structuredClone(value); throw new Error("serialization-only fixture"); },
+	}).result();
+	assert.ok(payload);
+	assert.equal(fetchCalls.length, before);
+	payload.prompt_cache_key = "original-cache-key";
+	payload.max_output_tokens = 1;
+	mutate(payload);
+	const visible = full.filter(message => message.role !== "system");
+	capture(current, { payload, contextMessages: visible });
+	for (const fn of handlers.context_with_system) fn({ messages: structuredClone(full) }, current);
+	return payload;
+}
+for (const credential of ["sk-current-fixture", "non-jwt-current-subscription-fixture"]) {
+	const current = responsesContext(credential);
+	const payload = await captureResponses(current);
+	const snapshot = structuredClone(payload);
+	fetchCalls.length = 0;
+	responseQueue = [() => responseStream()];
+	const event = compactEvent({ preparation: { messagesToSummarize: [userMsg, responsesAssistant] } });
+	const compacted = await handlers.session_before_compact[0](event, current);
+	assert.equal(compacted?.compaction?.details.kind, "cache-aligned-compaction");
+	assert.equal(compacted.compaction.firstKeptEntryId, event.preparation.firstKeptEntryId);
+	assert.equal(fetchCalls.length, 1);
+	const body = JSON.parse(fetchCalls[0].init.body);
+	assert.deepEqual(body.input.slice(0, -1), JSON.parse(JSON.stringify(payload.input.slice(0, -1))), "Multiple assistant wire items preserve the exact captured prefix");
+	assert.match(body.input.at(-1).content, /structured context checkpoint summary/);
+	assert.deepEqual(body.tools, JSON.parse(JSON.stringify(payload.tools)));
+	assert.equal(body.prompt_cache_key, payload.prompt_cache_key);
+	assert.equal(body.max_output_tokens, credential.startsWith("sk-") ? 8192 : undefined, "SDK replaces stale cap or omits it for current OAuth");
+	assert.equal(body.context_management, undefined);
+	assert.ok(!body.input.some(item => item.type === "compaction_trigger" || item.type === "compaction"));
+	assert.equal(body.stream, true);
+	assert.equal(body.store, false);
+	assert.equal(new Headers(fetchCalls[0].init.headers).get("authorization"), `Bearer ${credential}`, "Current SDK credential replaces captured stale bearer");
+	assert.equal(compacted.compaction.usage.cacheRead, 80);
+	assert.equal(compacted.compaction.usage.cacheWrite, 5);
+	assert.equal(compacted.compaction.usage.input, 15);
+	assert.equal(compacted.compaction.usage.reasoning, 2);
+	assert.deepEqual(payload, snapshot);
+}
+const responsesCtx = responsesContext("non-jwt-current-subscription-fixture");
+const responsesEvent = () => compactEvent({ preparation: { messagesToSummarize: [userMsg, responsesAssistant] } });
+for (const mutate of [
+	payload => { payload.previous_response_id = "external"; },
+	payload => { payload.conversation = "external"; },
+	payload => { payload.context_management = [{ type: "compaction", compact_threshold: 1 }]; },
+	payload => { payload.input.push({ type: "compaction", encrypted_content: "not-a-text-summary" }); },
+	payload => { payload.input.splice(1, 0, { role: "user", content: "Unexpected inserted item" }); },
+	payload => { payload.tool_choice = "required"; },
+]) {
+	await captureResponses(responsesCtx, fullResponses, mutate);
+	fetchCalls.length = 0;
+	assert.equal(await handlers.session_before_compact[0](responsesEvent(), responsesCtx), undefined);
+	assert.equal(fetchCalls.length, 0, "Unverifiable Responses state yields to native before network");
+}
+const validPayload = await captureResponses(responsesCtx);
+for (const full of [undefined, [fullResponses[0], { ...userMsg, content: "Changed by later context hook" }, ...fullResponses.slice(2)]]) {
+	capture(responsesCtx, { payload: validPayload, contextMessages: fullResponses.slice(1) });
+	if (full) for (const fn of handlers.context_with_system) fn({ messages: full }, responsesCtx);
+	fetchCalls.length = 0;
+	assert.equal(await handlers.session_before_compact[0](responsesEvent(), responsesCtx), undefined);
+	assert.equal(fetchCalls.length, 0, "Missing or misaligned full snapshot performs no request");
+}
+const responsesToolAssistant = { ...responsesAssistant, content: [{ type: "toolCall", id: "call_fixture|ctc_fixture", name: "grammar_fixture", namespace: "fixture_namespace", arguments: { input: "read only" } }], stopReason: "toolUse" };
+const toolResult = { role: "toolResult", toolCallId: "call_fixture|ctc_fixture", toolName: "grammar_fixture", content: [{ type: "text", text: "No result provided" }], isError: true, timestamp: 3 };
+const midSystem = { role: "system", content: "Mid-conversation update", timestamp: 3,
+	toolsAdded: [{ name: "later_fixture", description: "Read only", parameters: { type: "object", properties: {} } }] };
+const pairedFull = [fullResponses[0], userMsg, responsesToolAssistant, midSystem, toolResult, userNextCtx];
+const pairedPayload = await captureResponses(responsesCtx, pairedFull);
+fetchCalls.length = 0;
+assert.equal(await handlers.session_before_compact[0](compactEvent({ preparation: { messagesToSummarize: [userMsg, responsesToolAssistant] } }), responsesCtx), undefined);
+assert.equal(fetchCalls.length, 0, "Unfinished typed call cannot consume an identical retained synthetic-looking result");
+responseQueue = [() => responseStream()];
+result = await handlers.session_before_compact[0](compactEvent({ preparation: { messagesToSummarize: [userMsg, responsesToolAssistant, toolResult] } }), responsesCtx);
+assert.equal(result?.compaction?.details.kind, "cache-aligned-compaction");
+const pairedBody = JSON.parse(fetchCalls.at(-1).init.body);
+assert.deepEqual(pairedBody.input.slice(0, -1), JSON.parse(JSON.stringify(pairedPayload.input.slice(0, -1))));
+assert.equal(pairedBody.input.find(item => item.type === "custom_tool_call").namespace, "fixture_namespace");
+assert.ok(pairedBody.input.some(item => item.type === "custom_tool_call_output"));
+assert.ok(pairedBody.input.some(item => item.type === "additional_tools"), "SDK preserves inline tool additions and transparent mid-tool system updates");
+for (const options of [
+	{ status: "queued" }, { status: "in_progress" }, { status: null }, { status: "incomplete" }, { terminal: false },
+	{ extra: [{ type: "response.refusal.delta", delta: "refused" }] },
+	{ output: [{ type: "function_call", id: "fc_fixture", call_id: "call_fixture", name: "fixture", arguments: "{}", status: "completed" }] },
+	{ output: [{ type: "compaction", encrypted_content: "unsupported-output" }] },
+	{ output: [] }, { extra: [{ type: "error", code: "fixture_error", message: "Failed fixture" }] },
+]) {
+	await captureResponses(responsesCtx);
+	fetchCalls.length = 0;
+	responseQueue = [() => responseStream(options)];
+	assert.equal(await handlers.session_before_compact[0](responsesEvent(), responsesCtx), undefined, "Only complete text summaries can create a checkpoint");
+	assert.equal(fetchCalls.length, 1);
+}
+console.log("ok: AI: Responses actual SDK prefix, OAuth/API-key caps, current auth, usage, grammar pairing, guards, and terminal validation");
+
+// AJ: Responses limit recovery uses the same native cuts and cumulative SDK usage.
+const responsesRecoveryMessages = recoveryMessages.map(message => message.role === "assistant"
+	? { ...message, provider: "openai", api: "openai-responses", model: responsesModel.id } : message);
+const responsesRecoveryBranch = recoveryBranch.map((entry, index) => ({ ...entry, message: responsesRecoveryMessages[index] }));
+const responsesRecoveryPrep = prepareCompaction(responsesRecoveryBranch, recoverySettings);
+const responsesDoubledPrep = prepareCompaction(responsesRecoveryBranch, { ...recoverySettings, keepRecentTokens: 16384 });
+const responsesRecoveryCtx = { ...responsesContext("sk-current-fixture"), model: { ...responsesModel, maxTokens: 64000 } };
+for (const length of [true, false]) {
+	const payload = await captureResponses(responsesRecoveryCtx, [fullResponses[0], ...responsesRecoveryMessages]);
+	const original = structuredClone({ payload, branch: responsesRecoveryBranch });
+	fetchCalls.length = 0;
+	responseQueue = [length ? () => responseStream({ status: "incomplete" }) : () => Response.json({ error: { code: "context_length_exceeded", message: "Maximum context length exceeded" } }, { status: 400 }), () => responseStream()];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: responsesRecoveryPrep, branchEntries: responsesRecoveryBranch }), responsesRecoveryCtx);
+	assert.equal(result?.compaction?.details.kind, "cache-aligned-compaction");
+	assert.equal(fetchCalls.length, 2);
+	assert.equal(result.compaction.firstKeptEntryId, responsesDoubledPrep.firstKeptEntryId);
+	const bodies = fetchCalls.map(call => JSON.parse(call.init.body));
+	assert.ok(bodies[1].input.length < bodies[0].input.length);
+	assert.equal(bodies[0].max_output_tokens, 8192);
+	assert.equal(bodies[1].max_output_tokens, 16384);
+	assert.equal(result.compaction.usage.output, length ? 20 : 10);
+	assert.equal(result.compaction.usage.reasoning, length ? 4 : 2);
+	for (const body of bodies) assert.deepEqual(body.input.slice(0, -1), JSON.parse(JSON.stringify(payload.input.slice(0, body.input.length - 1))));
+	assert.deepEqual({ payload, branch: responsesRecoveryBranch }, original);
+}
+console.log("ok: AJ: Responses length/HTTP overflow retry with earlier cut, larger supported cap, cumulative reasoning/usage, and immutable history");
+
+// AK: A policy change after capture must not resend previously allowed images.
+const imageResponsesCtx = { ...responsesCtx, model: { ...responsesModel, input: ["text", "image"] } };
+const imageBlock = { type: "image", mimeType: "image/png", data: "AA==" };
+const imageUser = { ...userMsg, content: [{ type: "text", text: "Image fixture" }, imageBlock] };
+const imageResult = { ...toolResult, content: [...toolResult.content, imageBlock] };
+for (const [full, preCut, field] of [
+	[[fullResponses[0], imageUser, responsesAssistant, userNextCtx], [imageUser, responsesAssistant], "content"],
+	[[fullResponses[0], userMsg, responsesToolAssistant, imageResult, userNextCtx], [userMsg, responsesToolAssistant, imageResult], "output"],
+]) {
+	currentSettings = {};
+	const payload = await captureResponses(imageResponsesCtx, full);
+	assert.ok(payload.input.some(item => Array.isArray(item[field]) && item[field].some(block => block.type === "input_image")), "Actual SDK produces the image wire fixture");
+	const original = structuredClone(payload);
+	currentSettings = { images: { blockImages: true } };
+	fetchCalls.length = 0;
+	responseQueue = [];
+	result = await handlers.session_before_compact[0](compactEvent({ preparation: { messagesToSummarize: preCut } }), imageResponsesCtx);
+	assert.equal(result, undefined, "Current image policy yields to native before resending captured images");
+	assert.equal(fetchCalls.length, 0);
+	assert.deepEqual(payload, original, "Image policy does not mutate or trim the cached prefix");
+}
+await captureResponses(responsesCtx);
+fetchCalls.length = 0;
+responseQueue = [() => responseStream()];
+result = await handlers.session_before_compact[0](responsesEvent(), responsesCtx);
+assert.equal(result?.compaction?.details.kind, "cache-aligned-compaction", "Image blocking does not disable image-free Responses compaction");
+assert.equal(fetchCalls.length, 1);
+await captureOpenai();
+fetchCalls.length = 0;
+responseQueue = [okJson({ choices: [{ message: { content: "JSON path unchanged" }, finish_reason: "stop" }] })];
+result = await handlers.session_before_compact[0](compactEvent(), ctx);
+assert.equal(result?.compaction?.summary, "JSON path unchanged");
+assert.equal(fetchCalls.length, 1);
+currentSettings = {};
+console.log("ok: AK: Current image policy blocks captured user/tool-output images without altering prefixes or other text paths");
+
+// AL: Cancellation on the new SDK path cannot publish a summary checkpoint.
+for (const duringCompletion of [false, true]) {
+	const controller = new AbortController();
+	const delegate = responsesCtx.modelRegistry.streamSimple;
+	const cancelledCtx = { ...responsesCtx, modelRegistry: { streamSimple(current, context, options) {
+		if (!duringCompletion) controller.abort();
+		return delegate(current, context, { ...options, onProviderStreamEvent(data) {
+			options.onProviderStreamEvent?.(data);
+			if (duringCompletion && data.type === "response.completed") controller.abort();
+		} });
+	} } };
+	const payload = await captureResponses(cancelledCtx);
+	const original = structuredClone(payload);
+	fetchCalls.length = 0;
+	responseQueue = [() => responseStream()];
+	result = await handlers.session_before_compact[0]({ ...responsesEvent(), signal: controller.signal }, cancelledCtx);
+	assert.equal(controller.signal.aborted, true);
+	assert.equal(result, undefined, "Cancelled Responses summary cannot publish a checkpoint");
+	assert.equal(fetchCalls.length, duringCompletion ? 1 : 0, "Cancellation before serialization performs no HTTP; terminal cancellation never retries");
+	assert.deepEqual(payload, original, "Cancellation does not rewrite captured history");
+}
+console.log("ok: AL: Responses SDK cancellation before serialization and at response.completed never creates a checkpoint");
 
 console.log(process.exitCode ? "\nSOME TESTS FAILED" : "\nALL TESTS PASSED");
