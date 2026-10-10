@@ -19,8 +19,7 @@ const model = { ...configuredModel, contextWindow: 24000, maxTokens: 8192 };
 const workdir = await mkdtemp(path.join(tmpdir(), "pi-context-087-live-"));
 const extension = fileURLToPath(new URL("../index.ts", import.meta.url));
 const handoff = fileURLToPath(new URL("../../handoff/index.ts", import.meta.url));
-const expectedKind = provider === "openai-codex" ? "openai-codex-native-compaction"
-	: provider === "openai" ? undefined : "cache-aligned-compaction";
+const expectedKind = provider === "openai-codex" ? "openai-codex-native-compaction" : "cache-aligned-compaction";
 const PROJECT = "amber-migration-42";
 const CURRENT = "violet-release-73";
 const OMITTED = "OMITTED-CANARY-2916";
@@ -136,9 +135,13 @@ async function recall(session, both = false) {
 }
 async function runManual() {
 	const sm = SessionManager.inMemory(workdir);
-	seed(sm);
+	sm.appendMessage({ role: "user", content: `Project token: ${PROJECT}.`, timestamp: Date.now() });
 	let active = await create(sm);
 	try {
+		// Establish the real prompt/tool state before historical fixture records.
+		await recall(active.session);
+		seed(sm);
+		active.session.refreshContext();
 		await recall(active.session);
 		const before = structuredClone(sm.getEntries());
 		await bounded(active.session, () => active.session.compact("Preserve exact project token and current release token. Keep the summary concise."));
@@ -193,9 +196,13 @@ async function runManual() {
 }
 async function runThreshold() {
 	const sm = SessionManager.inMemory(workdir);
-	seed(sm);
+	sm.appendMessage({ role: "user", content: `Project token: ${PROJECT}.`, timestamp: Date.now() });
 	const { session, seen } = await create(sm, true);
 	try {
+		await recall(session);
+		seed(sm);
+		session.refreshContext();
+		for (const value of Object.values(seen)) if (Array.isArray(value)) value.length = 0;
 		await bounded(session, () => session.prompt("Call bulk_fixture exactly once. Then output only the project token. Do not call any other tools."));
 		console.log(JSON.stringify({ event: "threshold-trace", order: seen.order, failures: seen.failures,
 			errors: seen.errors, finalized: seen.finalized,

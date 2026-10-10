@@ -19,6 +19,7 @@ const renderers = {};
 const pi = {
 	on(name, fn) { (handlers[name] ??= []).push(fn); },
 	registerEntryRenderer(name, fn) { renderers[name] = fn; },
+	getSettings: () => ({}),
 	getAllTools: () => [],
 	getActiveTools: () => [],
 	appendEntry: () => {},
@@ -26,7 +27,7 @@ const pi = {
 factory(pi);
 assert.equal(handlers.session_before_compact.length, 1, "one compaction dispatcher");
 assert.equal(handlers.session_before_tree, undefined);
-assert.equal(handlers.session_tree, undefined);
+assert.equal(handlers.session_tree.length, 1, "tree navigation only invalidates text capture");
 assert.equal(handlers.turn_end, undefined, "modern pi retains ownership of timing");
 assert.ok(renderers["openai-codex-compaction-status"], "old status entries remain renderable");
 
@@ -262,12 +263,12 @@ assert.equal(result.compaction.firstKeptEntryId, prep.firstKeptEntryId);
 assert.equal(calls.at(-1).body.tool_choice, undefined);
 assert.equal(calls.at(-1).body.input, undefined);
 respond = () => new Response("bad request", { status: 400 });
-assert.equal(await handlers.session_before_compact[0](compactEvent(), regularCtx), undefined, "text failures still fall back to native");
+assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), regularCtx), { cancel: true }, "text failures cancel without native fallback");
 
 const beforeExcluded = calls.length;
 const beforeAuth = authCalls;
 for (const api of ["openai-completions", "openai-responses"]) {
-	assert.equal(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), undefined);
+	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), { cancel: true });
 }
 assert.equal(calls.length, beforeExcluded);
 assert.equal(authCalls, beforeAuth);
@@ -295,4 +296,65 @@ for (const oldCheckpoint of [checkpoint, { ...checkpoint, details: { ...checkpoi
 	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), publicCtx), { cancel: true });
 	assert.equal(calls.length, beforeNetwork, "Opaque history never reaches the public text path");
 }
-console.log("Combined dispatcher, Codex replay/failure, public opaque guard, provider isolation, and branch-summary tests passed.");
+// Unexpected adapter errors must not be swallowed into Pi's native summarizer.
+branch = regularBranch;
+const throwingEvent = { ...compactEvent(), get signal() { throw new Error("unexpected adapter failure"); } };
+const diagnostics = [];
+assert.deepEqual(await handlers.session_before_compact[0](throwingEvent, { ...regularCtx, hasUI: true,
+	ui: { notify: message => diagnostics.push(message) } }), { cancel: true });
+assert.match(diagnostics[0], /unexpected compaction error: unexpected adapter failure/);
+assert.deepEqual(await handlers.session_before_compact[0](throwingEvent, { ...regularCtx, hasUI: true,
+	ui: { notify() { throw new Error("UI unavailable"); } } }), { cancel: true });
+assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...regularCtx, model: { ...regularCtx.model, api: "unsupported" } }), { cancel: true });
+for (const api of ["openai-completions", "anthropic-messages"]) {
+	branch = [...regularBranch, checkpoint];
+	const before = calls.length;
+	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...regularCtx, model: { ...regularCtx.model, api } }), { cancel: true });
+	assert.equal(calls.length, before, "Opaque checkpoints block every text path");
+}
+// Stats stay outside model context and cannot append to a stale session/checkpoint.
+const appended = [];
+pi.appendEntry = (kind, data) => appended.push({ kind, data });
+let statsSession = "stats-session";
+let statsCheckpoint = { type: "compaction", id: "stats-checkpoint", tokensBefore: 50000, usage,
+	details: { kind: "cache-aligned-compaction", budget: { contextWindow: 200000, reserveTokens: 16000, keepRecentTokens: 8192 } } };
+const statsCtx = { ...ctx, mode: "tui", sessionManager: {
+	getSessionId: () => statsSession,
+	getBranch: () => [statsCheckpoint],
+	buildSessionProjection: () => ({ messages: [userNext] }),
+} };
+const emitStats = async (current = statsCtx, fromExtension = true) => {
+	for (const fn of handlers.session_compact) await fn({ fromExtension }, current);
+};
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+const validDetails = statsCheckpoint.details;
+for (const details of [undefined, { kind: "other" }, { ...validDetails, budget: { contextWindow: "invalid" } }]) {
+	statsCheckpoint = { ...statsCheckpoint, details };
+	await emitStats();
+}
+statsCheckpoint = { ...statsCheckpoint, details: validDetails };
+await emitStats({ ...statsCtx, mode: "print" });
+await emitStats(statsCtx, false);
+await tick();
+assert.equal(appended.length, 0);
+await emitStats();
+assert.equal(appended.length, 0, "stats append is deferred until after the native card");
+await tick();
+assert.equal(appended.length, 1);
+assert.equal(appended[0].kind, "cache-compaction-stats");
+assert.ok(appended[0].data.estimatedTokensAfter > 0);
+const plainTheme = { fg: (_color, text) => text, bg: (_color, text) => text };
+const rendered = renderers[appended[0].kind]({ data: appended[0].data }, {}, plainTheme).render(160).join("\n");
+assert.match(rendered, /Input budget: 184,000 \/ 200,000/);
+assert.match(rendered, /Summary: 1 input/);
+await emitStats();
+statsCheckpoint = { ...statsCheckpoint, id: "new-checkpoint" };
+await tick();
+await emitStats();
+statsSession = "new-session";
+await tick();
+await emitStats();
+for (const fn of handlers.session_shutdown) await fn({}, statsCtx);
+await tick();
+assert.equal(appended.length, 1, "stale checkpoint, session replacement, and shutdown suppress pending stats");
+console.log("Combined dispatcher, fail-closed errors, Codex replay, opaque guards, provider isolation, branch-summary, and stats tests passed.");

@@ -3,8 +3,8 @@
  *
  * pi's native compaction serializes the conversation into a fresh prompt under
  * a different system prompt, preventing direct reuse of the live conversation's
- * cached prefix. This extension instead reuses the exact wire payload
- * of the last live provider request (captured via before_provider_request),
+ * cached prefix. This extension instead reuses the provider payload captured
+ * by its before_provider_request handler (which must run after other transforms),
  * truncates its message list at the compaction cut point, and appends a
  * summarization instruction. Retained message content stays unchanged;
  * Anthropic cache metadata may move to the retained boundary. Cache reads
@@ -12,19 +12,26 @@
  *
  * Scope:
  * - Legacy openai-codex compaction remains owned by its checkpoint reader.
- * - Branch summarization stays native; no tree-navigation hooks are installed.
+ * - Branch summarization stays native; tree navigation only invalidates capture.
  * - openai-completions, openai-responses, and anthropic-messages are supported;
- *   anything else falls back to pi's native compaction.
+ *   anything else cancels compaction.
  *
+ * Missing capture is reconstructed from projected conversation and prompt state.
+ * Request-only extension transforms are not replayed during reconstruction.
  * Limit failures retry with doubled recent-history retention and a shorter
- * cached prefix. Other failures or exhausted retries yield to native compaction.
+ * cached prefix. Other failures or exhausted retries cancel compaction.
  * Saved history and persistent settings are unchanged until a summary succeeds.
  * Failed attempts can still add latency and cost.
  */
 
-import { convertToLlm, findCutPoint, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, convertToLlm, findCutPoint, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
 import { isContextOverflow, type Usage } from "@earendil-works/pi-ai";
 import fs from "node:fs";
+import { findNativeCheckpoint } from "./codex/native-compaction.ts";
+import { createTextCompaction, summaryOutputTokens, type Summary } from "./text-result.ts";
+
+type Conversation = Parameters<typeof convertToLlm>[0];
+type CompactionModel = NonNullable<ExtensionContext["model"]>;
 
 // Opt-in diagnostics; request bodies and authentication headers are not logged.
 const DEBUG_LOG = process.env.CC_DEBUG_LOG;
@@ -159,7 +166,7 @@ function isContextLimitError(status: number, text: string, model: NonNullable<Ex
 function prepareRetry(event: SessionBeforeCompactEvent, keepRecentTokens: number): SessionBeforeCompactEvent["preparation"] | undefined {
 	const entries = event.branchEntries;
 	// Pi's public cut selector reads raw entries, not the edited projection.
-	// Leave edit-aware limit recovery to native compaction.
+	// Cancel edit-aware limit recovery rather than guessing a raw-entry cut.
 	if (entries.some((entry) => entry.type === "context_edit")) return undefined;
 	const previousIndex = entries.findLastIndex((entry) => entry.type === "compaction");
 	const previous = entries[previousIndex];
@@ -210,20 +217,34 @@ function addUsage(total: Usage | undefined, next: Usage | undefined): Usage | un
 
 type JsonObject = Record<string, any>;
 
+type PayloadCapture =
+	| { state: "pending" }
+	| { state: "failed" }
+	| { state: "captured"; body: JsonObject };
+
 interface CapturedRequest {
 	modelKey: string;
-	payload: JsonObject | undefined;
-	headers: Record<string, string> | undefined;
-	// Agent context messages of the same request, captured via the "context"
-	// event. Used to prove prefix identity after omitting failed assistants
-	// that pi's provider serializers do not replay.
-	contextMessages: unknown[] | undefined;
-	// Responses can emit several wire items per assistant and inline prompt/tool
-	// updates. Keep the full transcript for SDK-verified prefix serialization.
-	fullContextMessages?: unknown[];
+	// Failed capture is not missing capture: only a pre-payload abort may
+	// discard a valid snapshot and permit saved-state reconstruction.
+	payload: PayloadCapture;
+	headers?: Record<string, string>;
+	contextMessages?: Conversation;
+	fullContextMessages?: Conversation;
 }
 
-const capturedBySession = new Map<string, CapturedRequest>();
+type ReadyCapture = CapturedRequest & {
+	payload: { state: "captured"; body: JsonObject };
+	headers: Record<string, string>;
+	contextMessages: Conversation;
+};
+
+function isReadyCapture(captured: CapturedRequest): captured is ReadyCapture {
+	return captured.payload.state === "captured" && captured.headers !== undefined && captured.contextMessages !== undefined;
+}
+
+function canDiscardAbortedCapture(captured: CapturedRequest): boolean {
+	return captured.payload.state === "pending" && captured.contextMessages !== undefined && captured.fullContextMessages !== undefined;
+}
 
 function isExcludedProvider(model: { provider: string }): boolean {
 	return model.provider === "openai-codex";
@@ -351,11 +372,11 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
 	return Object.keys(headers).some((key) => key.toLowerCase() === lower);
 }
 
-function setHeader(headers: Record<string, string>, name: string, value: string): void {
+function setHeader(headers: Record<string, string>, name: string, value: string | null): void {
 	for (const key of Object.keys(headers)) {
 		if (key.toLowerCase() === name.toLowerCase()) delete headers[key];
 	}
-	headers[name] = value;
+	if (value !== null) headers[name] = value;
 }
 
 function retainAnthropicCacheBoundary(messages: JsonObject[], cutIndex: number): JsonObject[] {
@@ -448,37 +469,20 @@ function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObj
 	return wire === messages.length ? cut : undefined;
 }
 
-async function summarizeResponses(ctx: ExtensionContext, captured: CapturedRequest, count: number, instruction: string, maxTokens: number, signal: AbortSignal): Promise<{ text: string; usage: Usage }> {
-	const model = ctx.model!;
-	const payload = captured.payload!;
-	const input = payload.input;
-	const knownTypes = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "additional_tools", "tool_search_call", "tool_search_output"]);
-	// External/opaque history cannot be proven from this local transcript.
-	if (payload.previous_response_id !== undefined || payload.conversation !== undefined || payload.context_management !== undefined ||
-		!Array.isArray(input) || input.some((item) => !isJsonObject(item) ||
-			(item.type !== undefined ? !knownTypes.has(item.type) : !["user", "assistant", "system", "developer"].includes(item.role)))) {
-		throw new Error("Responses history cannot be verified for cache-aligned compaction");
+export function cancelCompaction(ctx: ExtensionContext, reason: string): SessionBeforeCompactResult {
+	log({ ev: "cancel", reason });
+	try {
+		if (ctx.hasUI) ctx.ui.notify(`Cache-aligned compaction cancelled: ${reason}`, "warning");
+	} catch {
+		// Notification failures must not enable native compaction.
 	}
-	if (payload.tool_choice !== undefined && payload.tool_choice !== "auto" && payload.tool_choice !== "none") {
-		throw new Error("summary requires an unforced tool choice");
-	}
-	const full = captured.fullContextMessages?.filter((message) => !isOmittedAssistant(message));
-	const visible = (messages: unknown[]) => messages.filter((message) => !(isJsonObject(message) && message.role === "system"));
-	if (!full || !deepEqual(visible(full), visible(captured.contextMessages!.filter((message) => !isOmittedAssistant(message))))) {
-		throw new Error("Responses full transcript does not match the captured conversation");
-	}
-	const prefix: unknown[] = [];
-	let seen = 0;
-	for (const message of full) {
-		if (seen === count) break;
-		prefix.push(message);
-		if (!(isJsonObject(message) && message.role === "system")) seen++;
-	}
-	const context = { messages: convertToLlm(prefix as Parameters<typeof convertToLlm>[0]) };
-	// SDK orphan repair can add a synthetic result. Never let it consume a real
-	// retained result that happens to contain the same text at the cut point.
+	return { cancel: true };
+}
+
+function validateToolBoundary(messages: ReturnType<typeof convertToLlm>): void {
+	// Validate before SDK orphan repair can invent a missing result.
 	const pending = new Set<string>();
-	for (const message of context.messages) {
+	for (const message of messages) {
 		if (message.role === "system") continue;
 		if (message.role === "toolResult") {
 			if (!pending.delete(message.toolCallId)) throw new Error("unpaired tool result at summary boundary");
@@ -494,44 +498,33 @@ async function summarizeResponses(ctx: ExtensionContext, captured: CapturedReque
 		}
 	}
 	if (pending.size) throw new Error("unfinished tool turn at summary boundary");
-	const headers: Record<string, string> = {};
-	for (const [key, value] of Object.entries(captured.headers!)) {
-		// Current provider credentials are resolved by the registry, not replayed
-		// from a potentially stale captured Authorization header.
-		if (["authorization", "x-api-key", "content-length", "content-type", "accept"].includes(key.toLowerCase())) continue;
-		headers[key] = value;
-	}
+}
+
+async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof convertToLlm>, maxTokens: number, signal: AbortSignal,
+	onPayload: (generated: unknown) => JsonObject, headers?: Record<string, string>, pi?: ExtensionAPI): Promise<{ text: string; usage: Usage }> {
+	const model = ctx.model!;
+	validateToolBoundary(messages);
 	let invalidOutput = false;
 	const checkOutput = (item: unknown): void => {
 		if (!isJsonObject(item) || !["message", "reasoning"].includes(item.type) ||
 			(item.type === "message" && Array.isArray(item.content) && item.content.some((block: any) => block?.type !== "output_text"))) invalidOutput = true;
 	};
 	signal.throwIfAborted();
-	const result = await ctx.modelRegistry.streamSimple(model, context, {
+	const thinking = pi ? ctx.thinkingLevel ?? pi.getThinkingLevel() : undefined;
+	const result = await ctx.modelRegistry.streamSimple(model, { messages }, {
 		signal, maxTokens, headers, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: MAX_ATTEMPTS - 1,
 		sessionId: ctx.sessionManager.getSessionId(), transport: "sse",
+		...(thinking && thinking !== "off" ? { reasoning: thinking, thinkingBudgets: pi?.getSettings().thinkingBudgets } : {}),
 		onPayload: (generated) => {
 			signal.throwIfAborted();
-			// Use the same SDK serializer to prove the cut, then send the original
-			// captured items, not the reserialized copies. Unknown transforms yield
-			// to native compaction before any HTTP request is made.
-			if (!isJsonObject(generated) || !Array.isArray(generated.input) || generated.input.length === 0 ||
-				!deepEqual(generated.input, input.slice(0, generated.input.length))) {
-				throw new Error("Responses wire prefix does not match the compaction boundary");
-			}
-			const body: JsonObject = { ...payload, input: [...input.slice(0, generated.input.length), { role: "user", content: instruction }], stream: true, store: false };
-			// The SDK omits unsupported output caps for ChatGPT token sharing.
-			// Do not restore a captured one-token cap or invent an OAuth hard limit.
-			if (generated.max_output_tokens !== undefined) body.max_output_tokens = generated.max_output_tokens;
-			else delete body.max_output_tokens;
-			log({ ev: "request", api: model.api, cutIndex: generated.input.length, payloadMsgCount: input.length, bodyMsgCount: body.input.length, maxTokens: body.max_output_tokens });
-			return body;
+			return onPayload(generated);
 		},
 		onProviderStreamEvent: (data) => {
 			if (!isJsonObject(data)) return;
 			if (typeof data.type === "string" && data.type.startsWith("response.refusal.")) invalidOutput = true;
 			if (data.type === "response.output_item.added" || data.type === "response.output_item.done") checkOutput(data.item);
 			if (Array.isArray(data.response?.output)) data.response.output.forEach(checkOutput);
+			if (data.choices?.some((choice: any) => choice.delta?.refusal)) invalidOutput = true;
 		},
 	}).result();
 	signal.throwIfAborted();
@@ -540,36 +533,281 @@ async function summarizeResponses(ctx: ExtensionContext, captured: CapturedReque
 	if (result.stopReason === "length" || isContextOverflow(result, model.contextWindow)) {
 		throw new CompactionLimitError(`summary reached limit: ${result.rawStopReason ?? result.stopReason}`, result.usage);
 	}
-	if (result.stopReason !== "stop" || result.rawStopReason !== "completed") throw new Error(result.errorMessage ?? `summary did not finish normally: ${result.rawStopReason ?? result.stopReason}`);
+	const normal = model.api === "openai-responses" ? ["completed"] : model.api === "anthropic-messages" ? ["end_turn", "stop_sequence"] : ["stop"];
+	if (result.stopReason !== "stop" || !normal.includes(result.rawStopReason!)) throw new Error(result.errorMessage ?? `summary did not finish normally: ${result.rawStopReason ?? result.stopReason}`);
 	const text = stripCodeFences(result.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
 	if (!text) throw new Error("empty summary");
 	return { text, usage: result.usage };
 }
 
+async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeCompactEvent, ctx: ExtensionContext, expected: Conversation): Promise<Summary> {
+	if (findNativeCheckpoint(event.branchEntries).status !== "none") throw new Error("opaque Codex history cannot be reconstructed as text");
+	const projection = buildSessionProjection(event.branchEntries);
+	const boundary = projection.entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
+	if (boundary < 0) throw new Error("reconstruction retained boundary is missing");
+	// Project the full branch before selecting a prefix: later edits still apply.
+	// Keep ALL system deltas. The cut limits conversation, not prompt/tool state.
+	const prefix = projection.entries.flatMap((entry, index) => entry.messages.filter((message) =>
+		!isOmittedAssistant(message) && (index < boundary || message.role === "system"),
+	));
+	const conversation = prefix.filter((message) => message.role !== "system" && message.role !== "compactionSummary");
+	if (!deepEqual(conversation, expected)) throw new Error("reconstructed conversation does not match compaction preparation");
+	const previous = prefix.filter((message) => message.role === "compactionSummary");
+	if (previous.length !== (event.preparation.previousSummary === undefined ? 0 : 1) ||
+		(previous[0]?.role === "compactionSummary" && previous[0].summary !== event.preparation.previousSummary)) throw new Error("reconstructed previous summary does not match");
+	if (!prefix.some((message) => message.role === "system")) throw new Error("no saved system prompt; make a live request before compacting");
+	// A switch before before_agent_start has not applied model-system-prompt yet.
+	const lastModel = projection.model;
+	if (lastModel && (lastModel.provider !== ctx.model!.provider || lastModel.modelId !== ctx.model!.id)) throw new Error("model prompt is not applied; make a live request with the selected model first");
+	const lastSwitch = event.branchEntries.findLastIndex((entry) => entry.type === "model_change");
+	if (lastSwitch >= 0 && !event.branchEntries.slice(lastSwitch + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant" &&
+		entry.message.provider === ctx.model!.provider && entry.message.model === ctx.model!.id)) throw new Error("model prompt is not applied; make a live request with the selected model first");
+	const blockImages = pi.getSettings().images?.blockImages;
+	const filtered = blockImages ? prefix.map((message) => {
+		if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) return message;
+		return { ...message, content: message.content.map((block) => block.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : block)
+			.filter((block, index, blocks) => !(block.type === "text" && block.text === "Image reading is disabled." && index > 0 &&
+				blocks[index - 1].type === "text" && (blocks[index - 1] as { text: string }).text === block.text)) };
+	}) : prefix;
+	const model = ctx.model!;
+	const maxTokens = summaryOutputTokens(model, event.preparation.settings);
+	const instruction = buildInstruction(event.preparation.previousSummary, event.customInstructions);
+	return summarizeSdk(ctx, convertToLlm(filtered), maxTokens, event.signal, (generated) => {
+		if (!isJsonObject(generated)) throw new Error("invalid reconstructed payload");
+		const field = model.api === "openai-responses" ? "input" : "messages";
+		if (!Array.isArray(generated[field]) || generated[field].length === 0) throw new Error("empty reconstructed conversation");
+		const body = { ...generated, [field]: [...generated[field], { role: "user", content: model.api === "anthropic-messages" ? [{ type: "text", text: instruction }] : instruction }] };
+		log({ ev: "request", mode: "reconstructed", api: model.api, bodyMsgCount: body[field].length, maxTokens });
+		return body;
+	}, undefined, pi);
+}
+
+async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture, count: number, instruction: string, maxTokens: number, signal: AbortSignal): Promise<Summary> {
+	const model = ctx.model!;
+	const payload = captured.payload.body;
+	const input = payload.input;
+	const knownTypes = new Set(["message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "additional_tools", "tool_search_call", "tool_search_output"]);
+	// External/opaque history cannot be proven from this local transcript.
+	if (payload.previous_response_id !== undefined || payload.conversation !== undefined || payload.context_management !== undefined ||
+		!Array.isArray(input) || input.some((item) => !isJsonObject(item) ||
+			(item.type !== undefined ? !knownTypes.has(item.type) : !["user", "assistant", "system", "developer"].includes(item.role)))) {
+		throw new Error("Responses history cannot be verified for cache-aligned compaction");
+	}
+	if (payload.tool_choice !== undefined && payload.tool_choice !== "auto" && payload.tool_choice !== "none") {
+		throw new Error("summary requires an unforced tool choice");
+	}
+	const full = captured.fullContextMessages?.filter((message) => !isOmittedAssistant(message));
+	const visible = (messages: unknown[]) => messages.filter((message) => !(isJsonObject(message) && message.role === "system"));
+	if (!full || !deepEqual(visible(full), visible(captured.contextMessages.filter((message) => !isOmittedAssistant(message))))) {
+		throw new Error("Responses full transcript does not match the captured conversation");
+	}
+	const prefix: Conversation = [];
+	let seen = 0;
+	for (const message of full) {
+		if (seen === count) break;
+		prefix.push(message);
+		if (!(isJsonObject(message) && message.role === "system")) seen++;
+	}
+	// Never summarize under an older mapped prompt just because its update is
+	// beyond the conversation cut. Unknown/noncontiguous state needs a new cut,
+	// not an unchecked reconstruction around the captured request.
+	const systems = (messages: unknown[]) => messages.filter((message) => isJsonObject(message) && message.role === "system");
+	if (!deepEqual(systems(prefix), systems(full))) throw new Error("captured prefix would omit saved prompt/tool updates");
+	const context = { messages: convertToLlm(prefix) };
+	const headers: Record<string, string> = {};
+	for (const [key, value] of Object.entries(captured.headers)) {
+		// Current provider credentials are resolved by the registry, not replayed
+		// from a potentially stale captured Authorization header.
+		if (["authorization", "x-api-key", "content-length", "content-type", "accept"].includes(key.toLowerCase())) continue;
+		headers[key] = value;
+	}
+	return summarizeSdk(ctx, context.messages, maxTokens, signal, (generated) => {
+		// Use the same SDK serializer to prove the cut, then send the original
+		// captured items, not the reserialized copies. Unknown transforms cancel
+		// before any HTTP request is made.
+		if (!isJsonObject(generated) || !Array.isArray(generated.input) || generated.input.length === 0 ||
+			!deepEqual(generated.input, input.slice(0, generated.input.length))) {
+			throw new Error("Responses wire prefix does not match the compaction boundary");
+		}
+		const body: JsonObject = { ...payload, input: [...input.slice(0, generated.input.length), { role: "user", content: instruction }], stream: true, store: false };
+		// The SDK omits unsupported output caps for ChatGPT token sharing.
+		// Do not restore a captured one-token cap or invent an OAuth hard limit.
+		if (generated.max_output_tokens !== undefined) body.max_output_tokens = generated.max_output_tokens;
+		else delete body.max_output_tokens;
+		log({ ev: "request", api: model.api, cutIndex: generated.input.length, payloadMsgCount: input.length, bodyMsgCount: body.input.length, maxTokens: body.max_output_tokens });
+		return body;
+	}, headers);
+}
+
+function parseChatSummary(model: CompactionModel, data: JsonObject): Summary {
+	const isAnthropic = model.api === "anthropic-messages";
+	let text: string;
+	let usage: Usage | undefined;
+
+	if (isAnthropic) {
+		if (!["end_turn", "stop_sequence", "max_tokens", "model_context_window_exceeded"].includes(data.stop_reason)) {
+			throw new Error(`summary did not finish normally: ${data.stop_reason}`);
+		}
+		const blocks = Array.isArray(data.content) ? data.content : [];
+		if (blocks.some((block: JsonObject) => block?.type === "tool_use")) throw new Error("summary attempted to call a tool");
+		text = blocks.filter((block: JsonObject) => block?.type === "text" && typeof block.text === "string")
+			.map((block: JsonObject) => block.text).join("");
+		const u = data.usage;
+		if (u) {
+			const input = u.input_tokens ?? 0;
+			const cacheRead = u.cache_read_input_tokens ?? 0;
+			const cacheWrite = u.cache_creation_input_tokens ?? 0;
+			const output = u.output_tokens ?? 0;
+			usage = {
+				input, output, cacheRead, cacheWrite,
+				totalTokens: input + cacheRead + cacheWrite + output,
+				cost: computeCost(model, input, output, cacheRead, cacheWrite),
+			};
+		}
+	} else {
+		const choice = Array.isArray(data.choices) ? data.choices[0] : undefined;
+		const msg = choice?.message;
+		if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) throw new Error("summary attempted to call a tool");
+		if ((choice?.finish_reason !== "stop" && choice?.finish_reason !== "length") || msg?.function_call) {
+			throw new Error(`summary did not finish normally: ${choice?.finish_reason}`);
+		}
+		const content = msg?.content;
+		text = typeof content === "string" ? content : Array.isArray(content)
+			? content.filter((block: JsonObject) => block?.type === "text" && typeof block.text === "string")
+				.map((block: JsonObject) => block.text).join("") : "";
+		const u = data.usage;
+		if (u) {
+			// OpenAI, DeepSeek, and compatible providers use different cache fields.
+			const cached = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cached_tokens ?? 0;
+			const input = Math.max(0, (u.prompt_tokens ?? 0) - cached);
+			const output = u.completion_tokens ?? 0;
+			usage = {
+				input, output, cacheRead: cached, cacheWrite: 0,
+				totalTokens: u.total_tokens ?? input + cached + output,
+				cost: computeCost(model, input, output, cached, 0),
+			};
+		}
+	}
+
+	const stopReason = isAnthropic ? data.stop_reason : data.choices?.[0]?.finish_reason;
+	if (["length", "max_tokens", "model_context_window_exceeded"].includes(stopReason)) {
+		throw new CompactionLimitError(`summary reached limit: ${stopReason}`, usage);
+	}
+	text = stripCodeFences(text);
+	if (!text) throw new Error("empty summary");
+	return { text, usage };
+}
+
+// Manual replay is limited to captured Chat/Anthropic requests. Keep its
+// provider-specific transport and normalization out of capture/retry ownership.
+async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: ExtensionContext,
+	captured: ReadyCapture, context: Conversation, prefix: Conversation): Promise<Summary> {
+	const model = ctx.model!;
+	const prep = event.preparation;
+	const payload = captured.payload.body;
+	const messages = payload.messages;
+	const isAnthropic = model.api === "anthropic-messages";
+	const preCutCount = convertToLlm(prefix).length;
+	const cutIndex = findWireCut(convertToLlm(context), messages, preCutCount, isAnthropic);
+	if (cutIndex === undefined) throw new Error("wire boundary does not match the selected prefix");
+	const instruction = buildInstruction(prep.previousSummary, event.customInstructions);
+	const instructionMessage = {
+		role: "user",
+		content: isAnthropic ? [{ type: "text", text: instruction }] : instruction,
+	};
+	const body: JsonObject = {
+		...payload,
+		messages: [...(isAnthropic ? retainAnthropicCacheBoundary(messages, cutIndex) : messages.slice(0, cutIndex)), instructionMessage],
+		stream: false,
+	};
+	delete body.stream_options;
+	// Preserve explicit Anthropic thinking settings and their output allowance.
+	const thinkingTokens = isAnthropic && body.thinking?.type === "enabled" ? body.thinking.budget_tokens : 0;
+	const maxTokens = summaryOutputTokens(model, prep.settings, thinkingTokens);
+	if (!isAnthropic && body.max_completion_tokens !== undefined) {
+		body.max_completion_tokens = maxTokens;
+		delete body.max_tokens;
+	} else {
+		body.max_tokens = maxTokens;
+	}
+	// tool_choice can be part of the cached prompt, not just a decode setting.
+	const toolChoice = body.tool_choice;
+	if (toolChoice !== undefined && toolChoice !== "auto" && toolChoice !== "none" &&
+		!(isAnthropic && (toolChoice?.type === "auto" || toolChoice?.type === "none"))) {
+		throw new Error("captured request forces tool selection");
+	}
+
+	// SDK clients apply authentication after the headers hook. Resolve current
+	// credentials and endpoint overrides rather than replaying captured auth.
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) throw new Error(`authentication failed: ${auth.error}`);
+	const base = (auth.baseUrl ?? model.baseUrl).replace(/\/+$/, "");
+	const url = isAnthropic ? `${base}/v1/messages` : `${base}/chat/completions`;
+	const headers: Record<string, string> = {};
+	const ownsAuth = !!auth.apiKey || Object.keys(auth.headers ?? {}).some((key) =>
+		["authorization", "x-api-key"].includes(key.toLowerCase()),
+	);
+	for (const [key, value] of Object.entries(captured.headers)) {
+		const lower = key.toLowerCase();
+		if (lower === "content-length" || lower === "accept") continue;
+		// Keep hook-owned authentication only when the resolver does not own it.
+		if (ownsAuth && (lower === "authorization" || lower === "x-api-key")) continue;
+		setHeader(headers, key, value);
+	}
+	for (const [key, value] of Object.entries(auth.headers ?? {})) {
+		setHeader(headers, key, value);
+	}
+	if (isAnthropic) {
+		// The capture observes SDK params; these fields become HTTP headers.
+		if (Array.isArray(body.betas) && !hasHeader(headers, "anthropic-beta")) {
+			setHeader(headers, "anthropic-beta", body.betas.join(","));
+		}
+		if (body.user_profile_id != null && !hasHeader(headers, "anthropic-user-profile-id")) {
+			setHeader(headers, "anthropic-user-profile-id", String(body.user_profile_id));
+		}
+		delete body.betas;
+		delete body.user_profile_id;
+	}
+	if (auth.apiKey) {
+		const bearer = !isAnthropic || model.provider === "github-copilot" || auth.apiKey.includes("sk-ant-oat");
+		setHeader(headers, bearer ? "x-api-key" : "authorization", null);
+		setHeader(headers, bearer ? "authorization" : "x-api-key", bearer ? `Bearer ${auth.apiKey}` : auth.apiKey);
+	}
+	setHeader(headers, "content-type", "application/json");
+	setHeader(headers, "accept", "application/json");
+	if (isAnthropic && !hasHeader(headers, "anthropic-version")) {
+		setHeader(headers, "anthropic-version", "2023-06-01");
+	}
+
+	log({ ev: "request", url, preCutCount, cutIndex, payloadMsgCount: messages.length, bodyMsgCount: body.messages.length, maxTokens, keepRecentTokens: prep.settings.keepRecentTokens });
+	const data = await postJson(url, body, headers, event.signal, model);
+	log({ ev: "raw-usage", usage: data.usage });
+	return parseChatSummary(model, data);
+}
+
 export default function registerTextCompaction(pi: ExtensionAPI) {
+	const capturedBySession = new Map<string, CapturedRequest>();
+
 	// Fires once per provider request, before convertToLlm and before the
 	// payload is built: the agent context messages this request will be based
 	// on. Captured so compaction can verify prefix identity.
 	pi.on("context", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		capturedBySession.delete(sessionId);
-		if (!ctx.model || isExcludedProvider(ctx.model) || !Array.isArray(event.messages)) return undefined;
+		if (!ctx.model || isExcludedProvider(ctx.model)) return undefined;
+		const captured: CapturedRequest = { modelKey: modelKey(ctx.model), payload: { state: "pending" } };
+		capturedBySession.set(sessionId, captured);
 		try {
-			capturedBySession.set(sessionId, {
-				modelKey: modelKey(ctx.model),
-				payload: undefined,
-				headers: undefined,
-				contextMessages: structuredClone(event.messages),
-			});
+			if (Array.isArray(event.messages)) captured.contextMessages = structuredClone(event.messages);
 		} catch {
-			log({ ev: "fallback", stage: "context-clone" });
+			log({ ev: "capture-error", stage: "context-clone" });
 		}
 		return undefined;
 	});
 
 	pi.on("context_with_system", (event, ctx) => {
 		const existing = capturedBySession.get(ctx.sessionManager.getSessionId());
-		if (ctx.model?.api !== "openai-responses" || !existing || existing.modelKey !== modelKey(ctx.model)) return;
+		if (!ctx.model || !existing || existing.modelKey !== modelKey(ctx.model)) return;
 		try {
 			existing.fullContextMessages = structuredClone(event.messages);
 		} catch {
@@ -580,14 +818,16 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const existing = capturedBySession.get(sessionId);
-		if (!ctx.model || isExcludedProvider(ctx.model) || !existing || existing.modelKey !== modelKey(ctx.model) || !isJsonObject(event.payload)) {
+		if (!ctx.model || isExcludedProvider(ctx.model) || !existing || existing.modelKey !== modelKey(ctx.model)) {
 			capturedBySession.delete(sessionId);
 			return undefined;
 		}
+		// Preserve failed-capture state so it cannot masquerade as a clean reload.
+		existing.payload = { state: "failed" };
+		if (!isJsonObject(event.payload)) return undefined;
 		try {
-			existing.payload = structuredClone(event.payload);
+			existing.payload = { state: "captured", body: structuredClone(event.payload) };
 		} catch {
-			capturedBySession.delete(sessionId);
 			return undefined;
 		}
 		log({
@@ -610,31 +850,37 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		for (const [key, value] of Object.entries(event.headers)) {
 			if (value !== null) headers[key] = value;
 		}
-		capturedBySession.set(sessionId, {
-			modelKey: modelKey(ctx.model),
-			payload: existing?.payload,
-			headers,
-			contextMessages: existing?.contextMessages,
-			fullContextMessages: existing?.fullContextMessages,
-		});
+		existing.headers = headers;
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	const clearCapture = (_event: unknown, ctx: ExtensionContext): void => {
 		capturedBySession.delete(ctx.sessionManager.getSessionId());
+	};
+	pi.on("session_start", clearCapture);
+	pi.on("session_tree", clearCapture);
+	pi.on("session_shutdown", clearCapture);
+
+	pi.on("agent_end", (event, ctx) => {
+		const lastAssistant = event.messages.findLast((message) => message.role === "assistant");
+		// Some adapters report Esc as stopReason="error"; the agent signal is
+		// authoritative. Only discard a valid snapshot whose payload hook never ran.
+		if (!ctx.signal?.aborted && !(lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted")) return;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const captured = capturedBySession.get(sessionId);
+		if (captured && canDiscardAbortedCapture(captured)) {
+			capturedBySession.delete(sessionId);
+		}
 	});
 
-	const attempt = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+	const attempt = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult> => {
 		try {
 			event.signal?.throwIfAborted();
 			const model = ctx.model;
-			if (!model) return undefined;
-			// Decline before auth, preparation, or requests so other compaction
-			// extensions retain ownership regardless of handler load order.
-			if (isExcludedProvider(model)) return undefined;
+			if (!model) return cancelCompaction(ctx, "no selected model");
+			if (isExcludedProvider(model)) return cancelCompaction(ctx, "Codex requires its checkpoint adapter");
 			log({ ev: "compact-start", model: modelKey(model), reason: event.reason, willRetry: event.willRetry });
 			if (model.api !== "openai-completions" && model.api !== "openai-responses" && model.api !== "anthropic-messages") {
-				log({ ev: "fallback", stage: "unsupported-api", api: model.api });
-				return undefined;
+				return cancelCompaction(ctx, `unsupported API: ${model.api}`);
 			}
 
 			const prep = event.preparation;
@@ -643,281 +889,70 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 				...(prep.isSplitTurn ? prep.turnPrefixMessages : []),
 			].filter((message) => !isOmittedAssistant(message));
 			if (convertToLlm(preCutMessages).length < 1) {
-				log({ ev: "fallback", stage: "empty-preCut", msgCount: prep.messagesToSummarize.length });
-				return undefined;
+				return cancelCompaction(ctx, "no conversation to summarize");
 			}
 
 			const sessionId = ctx.sessionManager.getSessionId();
 			const captured = capturedBySession.get(sessionId);
-			if (!captured || captured.modelKey !== modelKey(model) || !captured.payload || !captured.headers) {
-				log({
-					ev: "fallback",
-					stage: "no-capture",
-					hasEntry: !!captured,
-					capturedModel: captured?.modelKey,
-					currentModel: modelKey(model),
-				});
-				return undefined;
+			if (!captured || captured.modelKey !== modelKey(model)) {
+				log({ ev: "reconstruct", model: modelKey(model) });
+				const summary = await summarizeReconstructed(pi, event, ctx, preCutMessages);
+				return { compaction: createTextCompaction(prep, model, summary) };
 			}
+			if (!isReadyCapture(captured)) return cancelCompaction(ctx, "incomplete live request capture");
 
-			const payload = captured.payload;
+			const payload = captured.payload.body;
 			const messages = model.api === "openai-responses" ? payload.input : payload.messages;
 			if (!Array.isArray(messages)) {
-				log({ ev: "fallback", stage: "no-messages-field" });
-				return undefined;
+				return cancelCompaction(ctx, "captured request has no conversation field");
+			}
+			// Never replay images disabled since capture, or rewrite a cached prefix.
+			if (pi.getSettings().images?.blockImages && messages.some((item) =>
+				[item?.content, item?.output].some((blocks) => Array.isArray(blocks) && blocks.some((block) =>
+					["input_image", "image", "image_url"].includes(block?.type))))) {
+				return cancelCompaction(ctx, "captured request contains currently blocked images");
 			}
 
 			// Match pi's known error/abort omissions in temporary views only.
 			// Saved history, the captured payload, and the retained boundary stay intact.
 			// Newer pi versions include prompt-state messages in the transcript.
 			// Native preparation omits them; their wire representation stays intact.
-			const capturedCtx = captured.contextMessages?.filter((message) =>
-				!isOmittedAssistant(message) && !(isJsonObject(message) && message.role === "system"),
+			const capturedCtx = captured.contextMessages.filter((message) =>
+				!isOmittedAssistant(message) && message.role !== "system",
 			);
-			if (!capturedCtx) {
-				log({ ev: "fallback", stage: "no-context-capture" });
-				return undefined;
-			}
-			if ((capturedCtx[0] as JsonObject)?.role === "compactionSummary") {
-				if ((capturedCtx[0] as JsonObject).summary !== prep.previousSummary) {
-					log({ ev: "fallback", stage: "previous-summary-mismatch" });
-					return undefined;
+			if (capturedCtx[0]?.role === "compactionSummary") {
+				if (capturedCtx[0].summary !== prep.previousSummary) {
+					return cancelCompaction(ctx, "captured previous summary differs from preparation");
 				}
-				preCutMessages.unshift(capturedCtx[0] as typeof preCutMessages[number]);
+				preCutMessages.unshift(capturedCtx[0]);
 			} else if (prep.previousSummary !== undefined) {
-				log({ ev: "fallback", stage: "missing-previous-summary" });
-				return undefined;
+				return cancelCompaction(ctx, "captured previous summary is missing");
 			}
 			if (capturedCtx.length < preCutMessages.length) {
-				log({ ev: "fallback", stage: "context-shorter-than-precut", ctxCount: capturedCtx.length, preCutCount: preCutMessages.length });
-				return undefined;
+				return cancelCompaction(ctx, "captured history is shorter than the selected prefix");
 			}
 			for (let i = 0; i < preCutMessages.length; i++) {
 				if (!deepEqual(capturedCtx[i], preCutMessages[i])) {
-					log({ ev: "fallback", stage: "context-mismatch", firstDivergence: i });
-					return undefined;
+					return cancelCompaction(ctx, `captured history differs at message ${i}`);
 				}
 			}
 
 			if (model.api === "openai-responses") {
-				// A policy changed after capture must not replay disabled images.
-				// Registry streams bypass Pi's Agent-level image filtering; yielding
-				// to native is safer than rewriting and invalidating the cached prefix.
-				if (pi.getSettings().images?.blockImages && messages.some((item) =>
-					[item?.content, item?.output].some((blocks) => Array.isArray(blocks) && blocks.some((block) => block?.type === "input_image")))) {
-					log({ ev: "fallback", stage: "blocked-images" });
-					return undefined;
-				}
-				const maxTokens = Math.max(1, Math.min(Math.max(8192, prep.settings.keepRecentTokens, prep.settings.reserveTokens), model.maxTokens > 0 ? model.maxTokens : Infinity));
-				const { text, usage } = await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), maxTokens, event.signal);
-				log({ ev: "compact-ok", summaryChars: text.length, usage });
-				return { compaction: {
-					summary: text, firstKeptEntryId: prep.firstKeptEntryId, tokensBefore: prep.tokensBefore, usage,
-					details: { kind: "cache-aligned-compaction", version: 1 },
-				} };
+				const maxTokens = summaryOutputTokens(model, prep.settings);
+				const summary = await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), maxTokens, event.signal);
+				return { compaction: createTextCompaction(prep, model, summary) };
 			}
 
-			const isAnthropic = model.api === "anthropic-messages";
-			const systemOffset = !isAnthropic && (messages[0]?.role === "system" || messages[0]?.role === "developer") ? 1 : 0;
-			const preCutCount = convertToLlm(preCutMessages).length;
-			const cutIndex = findWireCut(convertToLlm(capturedCtx as typeof preCutMessages), messages, preCutCount, isAnthropic);
-			if (cutIndex === undefined) {
-				log({ ev: "fallback", stage: "wire-boundary-mismatch", preCutCount, payloadMsgCount: messages.length });
-				return undefined;
-			}
-			const instruction = buildInstruction(prep.previousSummary, event.customInstructions);
-			const instructionMessage = isAnthropic
-				? { role: "user", content: [{ type: "text", text: instruction }] }
-				: { role: "user", content: instruction };
-
-			const body: JsonObject = {
-				...payload,
-				messages: [...(isAnthropic ? retainAnthropicCacheBoundary(messages, cutIndex) : messages.slice(0, cutIndex)), instructionMessage],
-				stream: false,
-			};
-			delete body.stream_options;
-			// The live request's output cap may have been clamped to one token.
-			// Budget this shorter summary independently of the captured output cap.
-			// On a limit failure, doubling retention shortens this prefix and raises
-			// its output allowance. The provider still enforces its context ceiling.
-			const summaryTokens = Math.max(8192, prep.settings.keepRecentTokens, prep.settings.reserveTokens);
-			// Preserve explicit Anthropic thinking settings and their output allowance.
-			const thinkingTokens = isAnthropic && body.thinking?.type === "enabled" ? body.thinking.budget_tokens : 0;
-			const maxTokens = Math.max(1, Math.min(summaryTokens + thinkingTokens, model.maxTokens > 0 ? model.maxTokens : Infinity));
-			if (!isAnthropic && body.max_completion_tokens !== undefined) {
-				body.max_completion_tokens = maxTokens;
-				delete body.max_tokens;
-			} else {
-				body.max_tokens = maxTokens;
-			}
-			// Preserve tool_choice: providers may encode it into the prompt rather
-			// than treating it as a decode-only setting. Reject tool responses below.
-			const toolChoice = body.tool_choice;
-			if (toolChoice !== undefined && toolChoice !== "auto" && toolChoice !== "none" &&
-				!(isAnthropic && (toolChoice?.type === "auto" || toolChoice?.type === "none"))) {
-				log({ ev: "fallback", stage: "forced-tool-choice" });
-				return undefined;
-			}
-
-			// SDK clients apply apiKey authentication after the headers hook.
-			// Resolve current credentials and any endpoint override for replay.
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) {
-				log({ ev: "fallback", stage: "auth-resolution", error: auth.error });
-				return undefined;
-			}
-			const base = (auth.baseUrl ?? model.baseUrl).replace(/\/+$/, "");
-			const url = isAnthropic ? `${base}/v1/messages` : `${base}/chat/completions`;
-
-			const headers: Record<string, string> = {};
-			for (const [key, value] of Object.entries(captured.headers)) {
-				const lower = key.toLowerCase();
-				if (lower === "content-length" || lower === "accept") continue;
-				headers[key] = value;
-			}
-			if (auth.headers) {
-				for (const [key, value] of Object.entries(auth.headers)) {
-					if (value !== null) headers[key] = value;
-				}
-			}
-			if (isAnthropic) {
-				// before_provider_request observes SDK params, not the HTTP body.
-				// The Anthropic SDK moves these fields into request headers.
-				if (Array.isArray(body.betas) && !hasHeader(headers, "anthropic-beta")) {
-					setHeader(headers, "anthropic-beta", body.betas.join(","));
-				}
-				if (body.user_profile_id != null && !hasHeader(headers, "anthropic-user-profile-id")) {
-					setHeader(headers, "anthropic-user-profile-id", String(body.user_profile_id));
-				}
-				delete body.betas;
-				delete body.user_profile_id;
-			}
-			if (auth.apiKey) {
-				const bearer = !isAnthropic || model.provider === "github-copilot" || auth.apiKey.includes("sk-ant-oat");
-				if (bearer) {
-					if (isAnthropic) {
-						for (const key of Object.keys(headers)) {
-							if (key.toLowerCase() === "x-api-key") delete headers[key];
-						}
-					}
-					setHeader(headers, "authorization", `Bearer ${auth.apiKey}`);
-				} else setHeader(headers, "x-api-key", auth.apiKey);
-			}
-			// The SDK clients set these at fetch time (not in the captured event
-			// headers), so they must be added explicitly.
-			setHeader(headers, "content-type", "application/json");
-			setHeader(headers, "accept", "application/json");
-			if (isAnthropic && !hasHeader(headers, "anthropic-version")) {
-				setHeader(headers, "anthropic-version", "2023-06-01");
-			}
-
-			const signal = event.signal;
-			log({ ev: "request", url, preCutCount, cutIndex, payloadMsgCount: messages.length, systemOffset, bodyMsgCount: body.messages.length, maxTokens, keepRecentTokens: prep.settings.keepRecentTokens });
-			const data = await postJson(url, body, headers, signal, model);
-			log({ ev: "raw-usage", usage: data.usage });
-
-			let text: string;
-			let usage: Usage | undefined;
-
-			if (isAnthropic) {
-				if (data.stop_reason !== "end_turn" && data.stop_reason !== "stop_sequence" && data.stop_reason !== "max_tokens" && data.stop_reason !== "model_context_window_exceeded") {
-					throw new Error(`summary did not finish normally: ${data.stop_reason}`);
-				}
-				const blocks = Array.isArray(data.content) ? data.content : [];
-				if (blocks.some((b: any) => b?.type === "tool_use")) throw new Error("summary attempted to call a tool");
-				text = blocks
-					.filter((b: any) => b?.type === "text" && typeof b.text === "string")
-					.map((b: any) => b.text)
-					.join("");
-				const u = data.usage;
-				if (u) {
-					const input = u.input_tokens ?? 0;
-					const cacheRead = u.cache_read_input_tokens ?? 0;
-					const cacheWrite = u.cache_creation_input_tokens ?? 0;
-					const output = u.output_tokens ?? 0;
-					usage = {
-						input,
-						output,
-						cacheRead,
-						cacheWrite,
-						totalTokens: input + cacheRead + cacheWrite + output,
-						cost: computeCost(model, input, output, cacheRead, cacheWrite),
-					};
-				}
-			} else {
-				const choice = Array.isArray(data.choices) ? data.choices[0] : undefined;
-				const msg = choice?.message;
-				if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
-					throw new Error("summary attempted to call a tool");
-				}
-				if ((choice?.finish_reason !== "stop" && choice?.finish_reason !== "length") || msg?.function_call) {
-					throw new Error(`summary did not finish normally: ${choice?.finish_reason}`);
-				}
-				const content = msg?.content;
-				text =
-					typeof content === "string"
-						? content
-						: Array.isArray(content)
-							? content
-									.filter((p: any) => p?.type === "text" && typeof p.text === "string")
-									.map((p: any) => p.text)
-									.join("")
-							: "";
-				const u = data.usage;
-				if (u) {
-					// OpenAI reports prompt_tokens_details.cached_tokens; DeepSeek uses
-					// prompt_cache_hit_tokens; some compat providers use cached_tokens.
-					const cached = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cached_tokens ?? 0;
-					const input = Math.max(0, (u.prompt_tokens ?? 0) - cached);
-					const output = u.completion_tokens ?? 0;
-					usage = {
-						input,
-						output,
-						cacheRead: cached,
-						cacheWrite: 0,
-						totalTokens: u.total_tokens ?? input + cached + output,
-						cost: computeCost(model, input, output, cached, 0),
-					};
-				}
-			}
-
-			const stopReason = isAnthropic ? data.stop_reason : data.choices?.[0]?.finish_reason;
-			if (stopReason === "length" || stopReason === "max_tokens" || stopReason === "model_context_window_exceeded") {
-				throw new CompactionLimitError(`summary reached limit: ${stopReason}`, usage);
-			}
-
-			text = stripCodeFences(text);
-			if (!text) throw new Error("empty summary");
-
-			log({ ev: "compact-ok", summaryChars: text.length, usage });
-			return {
-				compaction: {
-					summary: text,
-					firstKeptEntryId: prep.firstKeptEntryId,
-					tokensBefore: prep.tokensBefore,
-					usage,
-					details: { kind: "cache-aligned-compaction", version: 1 },
-				},
-			};
+			const summary = await summarizeCapturedChat(event, ctx, captured, capturedCtx, preCutMessages);
+			return { compaction: createTextCompaction(prep, model, summary) };
 		} catch (err) {
 			if (err instanceof CompactionLimitError) throw err;
-			log({ ev: "fallback", stage: "error", error: err instanceof Error ? err.message : String(err) });
-			try {
-				if (ctx.hasUI) {
-					ctx.ui.notify(
-						`Cache-aligned compaction failed, falling back to native: ${err instanceof Error ? err.message : String(err)}`,
-						"warning",
-					);
-				}
-			} catch {
-				// A UI failure must not prevent native fallback.
-			}
-			return undefined;
+			return cancelCompaction(ctx, err instanceof Error ? err.message : String(err));
 		}
 	};
 
-	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
-		if (!ctx.model || isExcludedProvider(ctx.model)) return undefined;
+	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult> => {
+		if (!ctx.model || isExcludedProvider(ctx.model)) return cancelCompaction(ctx, "no supported text-compaction model selected");
 		let current = event;
 		let usage: Usage | undefined;
 		// One deadline for the whole recovery, including transport retries.
@@ -925,8 +960,11 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		for (let retry = 0; ; retry++) {
 			try {
 				const result = await attempt({ ...current, signal }, ctx);
-				if (result?.compaction) result.compaction.usage = addUsage(usage, result.compaction.usage);
-				return result;
+				if (result?.compaction) {
+					result.compaction.usage = addUsage(usage, result.compaction.usage);
+					log({ ev: "compact-ok", summaryChars: result.compaction.summary.length, usage: result.compaction.usage });
+				}
+				return result ?? cancelCompaction(ctx, "no summary checkpoint produced");
 			} catch (err) {
 				if (!(err instanceof CompactionLimitError)) throw err;
 				usage = addUsage(usage, err.usage);
@@ -938,20 +976,15 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 						try {
 							next = prepareRetry(current, keepRecentTokens);
 						} catch {
-							// Invalid preparation must still yield to native compaction.
+							// Invalid preparation must still cancel compaction.
 						}
 					}
 				}
 				const previousIndex = event.branchEntries.findIndex((entry) => entry.id === current.preparation.firstKeptEntryId);
 				const nextIndex = next ? event.branchEntries.findIndex((entry) => entry.id === next.firstKeptEntryId) : -1;
 				if (!next || nextIndex < 0 || nextIndex >= previousIndex) {
-					log({ ev: "fallback", stage: "limit-exhausted", retry, error: err.message, usage });
-					try {
-						if (ctx.hasUI && !signal.aborted) ctx.ui.notify(`Cache-aligned compaction limit recovery exhausted; falling back to native: ${err.message}`, "warning");
-					} catch {
-						// UI failures must not prevent native fallback.
-					}
-					return undefined;
+					log({ ev: "limit-exhausted", retry, error: err.message, usage });
+					return cancelCompaction(ctx, `limit recovery exhausted: ${err.message}`);
 				}
 				log({ ev: "limit-retry", retry: retry + 1, error: err.message, keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
 				try {
