@@ -123,10 +123,23 @@ ${UPDATE_INSTRUCTIONS}`;
 
 const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response must be the summary text in the exact format above, with no explanations and no code fences.`;
 
-const REQUEST_TIMEOUT_MS = 300_000;
+// Per HTTP request, including its streamed body. Large summaries at high
+// reasoning effort can exceed five minutes.
+const REQUEST_TIMEOUT_MS = 900_000;
 const RETRY_DELAY_MS = 2_000;
 const MAX_ATTEMPTS = 2;
 const MAX_LIMIT_RETRIES = 4;
+// Whole compaction, so a transport retry is not starved by its predecessor.
+const COMPACTION_TIMEOUT_MS = REQUEST_TIMEOUT_MS * MAX_ATTEMPTS;
+
+function requestSignal(signal: AbortSignal | null | undefined): AbortSignal {
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+// Resolve fetch per call so test stubs of globalThis.fetch still apply.
+const timedFetch: typeof globalThis.fetch = (input, init) =>
+	globalThis.fetch(input, { ...init, signal: requestSignal(init?.signal) });
 
 class CompactionLimitError extends Error {
 	constructor(message: string, readonly usage?: Usage) {
@@ -334,7 +347,7 @@ async function postJson(url: string, body: JsonObject, headers: Record<string, s
 				method: "POST",
 				headers,
 				body: JSON.stringify(body),
-				signal,
+				signal: requestSignal(signal),
 			});
 			if (res.ok) {
 				const data = await res.json();
@@ -512,7 +525,7 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 	signal.throwIfAborted();
 	const thinking = pi ? ctx.thinkingLevel ?? pi.getThinkingLevel() : undefined;
 	const result = await ctx.modelRegistry.streamSimple(model, { messages }, {
-		signal, maxTokens, headers, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: MAX_ATTEMPTS - 1,
+		signal, fetch: timedFetch, maxTokens, headers, timeoutMs: REQUEST_TIMEOUT_MS, maxRetries: MAX_ATTEMPTS - 1,
 		sessionId: ctx.sessionManager.getSessionId(), transport: "sse",
 		...(thinking && thinking !== "off" ? { reasoning: thinking, thinkingBudgets: pi?.getSettings().thinkingBudgets } : {}),
 		onPayload: (generated) => {
@@ -955,8 +968,8 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		if (!ctx.model || isExcludedProvider(ctx.model)) return cancelCompaction(ctx, "no supported text-compaction model selected");
 		let current = event;
 		let usage: Usage | undefined;
-		// One deadline for the whole recovery, including transport retries.
-		const signal = AbortSignal.any([event.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
+		// Each HTTP request has its own timeout; this bounds the whole recovery.
+		const signal = AbortSignal.any([event.signal, AbortSignal.timeout(COMPACTION_TIMEOUT_MS)]);
 		for (let retry = 0; ; retry++) {
 			try {
 				const result = await attempt({ ...current, signal }, ctx);
