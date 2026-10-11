@@ -1,7 +1,7 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { realpath, rm, stat } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { createConnection } from "node:net";
+import { createConnection, type AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -26,8 +26,16 @@ function sessionState(value: unknown): SessionState | undefined {
 // The claude-mod plugin runs inside Claude without Node, so it cannot serve
 // info requests itself; it posts session state here and this adapter relays it.
 // The mod's /agent-text command reads the agent list back the same way.
+// The mod can only reach Unix sockets, so on Windows the path holds the
+// loopback port and a key the mod must present instead.
 async function listenState(path: string, receive: (state: SessionState) => void, agents: () => Promise<AgentInfo[]>): Promise<() => Promise<void>> {
+	const key = process.platform === "win32" ? Buffer.from(randomBytes(32).toString("hex")) : undefined;
 	const server = createServer((req, res) => {
+		const given = Buffer.from(String(req.headers["x-agent-text-key"] ?? ""));
+		if (key && (given.length !== key.length || !timingSafeEqual(given, key))) {
+			res.writeHead(403).end();
+			return;
+		}
 		if (req.method === "GET" && req.url === "/agents") {
 			void agents().then(
 				(list) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(list)),
@@ -55,17 +63,19 @@ async function listenState(path: string, receive: (state: SessionState) => void,
 	await rm(path, { force: true });
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
-		server.listen(path, () => {
+		server.listen(key ? { host: "127.0.0.1", port: 0 } : { path }, () => {
 			server.off("error", reject);
 			resolve();
 		});
 	});
 	server.unref();
+	if (key) await writeFile(path, JSON.stringify({ port: (server.address() as AddressInfo).port, key: key.toString() }));
 	const { ino } = await stat(path);
 	return async () => {
 		server.closeAllConnections();
 		// Closing unlinks the path, which a newer adapter for the same Claude process may own by now.
 		if ((await stat(path).catch(() => undefined))?.ino !== ino) return;
+		if (key) await rm(path, { force: true });
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 	};
 }
@@ -230,18 +240,16 @@ async function main(): Promise<void> {
 
 	mcp.oninitialized = () => {
 		if (closeState || outgoing.signal.aborted) return;
-		if (process.platform !== "win32") {
-			// Both sides derive this path from Claude's config directory and inbox name.
-			const states = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "agent-text");
-			void privateDirectory(states)
-				.then(() => listenState(
-					join(states, basename(inbox)),
-					(value) => { state = value; },
-					async () => [await info(await ownerInfo(ownerPid, inbox)), ...await discoverAgents(directory, id, outgoing.signal)],
-				))
-				.then((stop) => { closeState = stop; })
-				.catch((error) => console.error(`agent-text: session state unavailable: ${error.message}`));
-		}
+		// Both sides derive this path from Claude's config directory and inbox name.
+		const states = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "agent-text");
+		void privateDirectory(states)
+			.then(() => listenState(
+				join(states, basename(inbox)),
+				(value) => { state = value; },
+				async () => [await info(await ownerInfo(ownerPid, inbox)), ...await discoverAgents(directory, id, outgoing.signal)],
+			))
+			.then((stop) => { closeState = stop; })
+			.catch((error) => console.error(`agent-text: session state unavailable: ${error.message}`));
 	};
 	mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{

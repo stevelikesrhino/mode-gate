@@ -15,20 +15,25 @@ type Agent = {
 }
 
 // The agent-text MCP adapter listens on this path; both sides derive it from
-// Claude's config directory and the inbox socket's name.
-async function adapter($: EngineInterface): Promise<string | undefined> {
+// Claude's config directory and the inbox socket's name. On Windows (a named
+// pipe inbox) the path holds the adapter's loopback port and key instead.
+async function call($: EngineInterface, path: string, init: { method?: string; body?: string } = {}) {
   const inbox = await $.env.get('CLAUDE_CODE_MESSAGING_SOCKET')
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`
-  return inbox && `${config}/agent-text/${inbox.slice(inbox.lastIndexOf('/') + 1)}`
+  if (!inbox) throw new Error('No messaging socket.')
+  const name = inbox.slice(Math.max(inbox.lastIndexOf('/'), inbox.lastIndexOf('\\')) + 1)
+  if (!inbox.startsWith('\\\\.\\pipe\\')) {
+    const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`
+    return $.http.fetch(`http://agent-text${path}`, { ...init, socketPath: `${config}/agent-text/${name}` })
+  }
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('USERPROFILE')}\\.claude`
+  const { port, key } = JSON.parse(await $.fs.read(`${config}\\agent-text\\${name}`)) as { port: number; key: string }
+  return $.http.fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers: { 'x-agent-text-key': key } })
 }
 
 async function push($: EngineInterface): Promise<boolean> {
-  const socketPath = await adapter($)
-  if (!socketPath) return false
   try {
-    const { ok } = await $.http.fetch('http://agent-text/state', {
+    const { ok } = await call($, '/state', {
       method: 'POST',
-      socketPath,
       body: JSON.stringify({
         sessionId: await $.session.id(),
         cwd: (await $.session.cwd()).slice(0, 300),
@@ -68,9 +73,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'agent-text' }, async $ => {
     try {
-      const socketPath = await adapter($)
-      if (!socketPath) throw new Error()
-      const { ok, text } = await $.http.fetch('http://agent-text/agents', { socketPath })
+      const { ok, text } = await call($, '/agents')
       if (!ok) throw new Error()
       const [self, ...others] = JSON.parse(text) as Agent[]
       const rows = [self, ...others].map(agent =>
