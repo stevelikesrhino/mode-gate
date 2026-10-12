@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
@@ -9,7 +10,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const windows = process.platform === "win32";
 const root = process.env.PI_ROOT ?? (windows
 	? join(process.env.APPDATA, "npm/node_modules/@earendil-works/pi-coding-agent")
-	: "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent");
+	: join(npmRoot(), "@earendil-works/pi-coding-agent"));
+function npmRoot() {
+	try {
+		return execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+	} catch {
+		return "/opt/homebrew/lib/node_modules";
+	}
+}
 const profile = await mkdtemp(join(tmpdir(), windows ? "pi-agent-text-test-你好 ' " : "pi-agent-text-test-"));
 process.env.PI_CODING_AGENT_DIR = profile;
 const { createJiti } = await import(pathToFileURL(join(root, "node_modules/jiti/lib/jiti-static.mjs")).href);
@@ -45,6 +53,8 @@ async function agent(sessionId = randomUUID(), name = "test agent") {
 	const tools = {};
 	const commands = {};
 	const received = [];
+	const popups = [];
+	const notes = [];
 	let idle = true;
 	const ctx = {
 		cwd: `/tmp/project-${name}`,
@@ -52,7 +62,22 @@ async function agent(sessionId = randomUUID(), name = "test agent") {
 		sessionManager: { getSessionId: () => sessionId },
 		isIdle: () => idle,
 		hasUI: true,
-		ui: { setStatus() {}, notify() {} },
+		ui: {
+			setStatus() {},
+			notify(message, type) { notes.push({ message, type }); },
+			async custom(factory) {
+				let closed = false;
+				const component = await factory(
+					{ terminal: { rows: 40 }, requestRender() {} },
+					{ fg: (_color, text) => text, bold: (text) => text },
+					{ getKeys: () => ["escape"], matches: (data, name) => data === name },
+					() => { closed = true; },
+				);
+				const lines = component.render(120);
+				component.handleInput("tui.select.cancel");
+				popups.push({ lines, closed });
+			},
+		},
 	};
 	const emit = async (type) => {
 		for (const fn of handlers[type] ?? []) await fn({ type }, ctx);
@@ -72,7 +97,7 @@ async function agent(sessionId = randomUUID(), name = "test agent") {
 	const call = async (name, args = {}, signal) => (await tools[name].execute("test", args, signal)).details;
 	const self = (await call("list_agent")).self;
 	const value = {
-		self, sessionId, ctx, received, call, emit,
+		self, sessionId, ctx, received, popups, notes, call, emit,
 		command: (name) => commands[name].handler("", ctx),
 		setIdle: (value) => { idle = value; },
 		stop: () => emit("session_shutdown"),
@@ -92,6 +117,29 @@ try {
 	await assert.rejects(listen(join(directory, `${b.self}.sock`), () => ({ status: "rejected" })), { code: windows ? "EEXIST" : "EADDRINUSE" });
 	assert.equal((await request(directory, b.self, { kind: "info" })).agent.id, b.self);
 	console.log("PASS discovery across projects, eight-character IDs, collision protection, private socket directory");
+
+	const evil = await agent(undefined, "evil\nname\u001b[31m\u202e");
+	a.ctx.mode = "tui";
+	await a.command("agent-text");
+	const popup = a.popups.at(-1);
+	assert.equal(popup.closed, true);
+	assert.equal(popup.lines[0], "Online agents (4)");
+	const table = popup.lines.slice(1, -1);
+	assert.match(table[0], /^\u256d/);
+	assert.match(table.at(-1), /^\u2570/);
+	assert.match(table[1], /^\u2502 Kind +\u2502 Status \u2502 ID +\u2502 Model +\u2502 Directory +\u2502$/);
+	const rows = table.slice(2).filter((line) => line.startsWith("\u2502"));
+	assert.equal(rows.length, 4);
+	assert.equal(table.filter((line) => line.startsWith("\u251c")).length, 4);
+	assert.match(rows[0], new RegExp(`^\u2502 pi \\(you\\) \u2502 idle +\u2502 ${a.self} \u2502 model +\u2502 /tmp/project-A +\u2502$`));
+	assert.deepEqual(new Set(rows.slice(1).map((row) => row.split("\u2502")[3].trim())), new Set([b.self, c.self, evil.self]));
+	assert.ok(rows.find((row) => row.includes(evil.self)).includes("/tmp/project-evil name [31m  "));
+	assert.ok(popup.lines.every((line) => !/[\x00-\x1f\x7f-\x9f\u202e]/.test(line) && [...line].length <= 120));
+	a.ctx.mode = undefined;
+	await a.command("agent-text");
+	assert.match(a.notes.at(-1).message, /^Online agents \(4\)\n\u256d/);
+	await evil.stop();
+	console.log("PASS /agent-text shows a bordered table, self first, sanitized, plain text outside the TUI");
 	await b.emit("session_start");
 	assert.equal((await a.call("list_agent")).agents.length, 2);
 	await b.stop();
@@ -134,6 +182,12 @@ try {
 
 	await b.command("offline");
 	assert.ok(!(await a.call("list_agent")).agents.some((x) => x.id === b.self));
+	const popupsBefore = b.popups.length;
+	b.ctx.mode = "tui";
+	await b.command("agent-text");
+	b.ctx.mode = undefined;
+	assert.equal(b.popups.length, popupsBefore);
+	assert.match(b.notes.at(-1).message, /offline/);
 	assert.match((await a.call("text_agent", { ids: [b.self], text: "cached ID" })).results[0].reason, /Offline/);
 	await assert.rejects(b.call("text_agent", { ids: [a.self], text: "outgoing" }), /offline/);
 	await assert.rejects(b.call("list_agent"), /offline/);

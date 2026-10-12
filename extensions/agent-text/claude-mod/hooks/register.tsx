@@ -1,18 +1,17 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import type { Agent } from '../types'
+import { agentTable } from './table'
+
+const PANE = 'agent-text'
+const agents = atom({ plugin: 'agent-text-session', key: 'agents' } as const, [])
+
 let status: 'idle' | 'busy' = 'idle'
+let isSending = false
+let isQueued = false
 let retry: { cancel: () => void } | undefined
 let retries = 0
-
-type Agent = {
-  id: string
-  name?: string
-  cwd: string
-  provider?: string
-  model?: string
-  kind?: string
-  status: string
-}
 
 // The agent-text MCP adapter listens on this path; both sides derive it from
 // Claude's config directory and the inbox socket's name. On Windows (a named
@@ -47,86 +46,102 @@ async function push($: EngineInterface): Promise<boolean> {
   }
 }
 
-// The adapter may start after the session does, so a failed report is retried
-// for a minute; later events report again either way.
-async function report($: EngineInterface): Promise<void> {
-  const isSent = await push($)
-  if (isSent || retries >= 30) {
-    retry?.cancel()
-    retry = undefined
-    retries = 0
-  } else {
-    retry ??= $.clock.every(2000, () => {
-      retries++
-      void report($)
-    })
+// Hooks never wait on a report. One request is in flight at a time, until it
+// settles: $.http.fetch cannot be cancelled, so giving up on one would leave it
+// to land after newer state. One left unanswered holds later reports queued
+// behind it until its adapter exits and the connection closes; adapters that
+// read status from Claude's registry then show only a stale model. Reports
+// asked for meanwhile fold into one sent after it, with the state as it is
+// then. The adapter may start after the session does, so a failed report is
+// retried 2 s after it settles, up to 30 times per event; the next event
+// reports again either way.
+async function report($: EngineInterface, isRetry = false): Promise<void> {
+  if (!isRetry) retries = 0
+  if (isSending) {
+    isQueued = true
+    return
   }
+  retry?.cancel()
+  retry = undefined
+  isSending = true
+  const isSent = await push($)
+  isSending = false
+  if (isQueued) {
+    isQueued = false
+    return report($)
+  }
+  if (isSent || retries >= 30) return
+  retries++
+  retry = $.clock.after(2000, () => {
+    retry = undefined
+    void report($, true)
+  })
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'agent-text', description: 'Show online Pi and Claude Code agents' })
     const started = await next(e)
-    await report($)
+    void report($)
     return started
   })
 
-  on('command.run', { command: 'agent-text' }, async $ => {
+  on('command.run', { command: 'agent-text' }, async ($, e) => {
+    let list: Agent[]
     try {
       const { ok, text } = await call($, '/agents')
       if (!ok) throw new Error()
-      const [self, ...others] = JSON.parse(text) as Agent[]
-      const rows = [self, ...others].map(agent =>
-        [
-          `${agent.name || 'Unnamed session'}${agent === self ? ' (you)' : ''} — ${agent.kind ?? 'pi'} · ${agent.status}`,
-          `  ${agent.id}`,
-          `  ${agent.provider ?? 'No provider'}/${agent.model ?? 'model unknown'}`,
-          `  ${agent.cwd}`,
-        ].join('\n'),
-      )
-      return { text: [`Online agents (${rows.length})`, ...rows].join('\n\n') }
+      list = JSON.parse(text) as Agent[]
     } catch {
       return { text: 'The agent-text adapter is not reachable from this session.' }
     }
+    await update($, agents, () => list)
+    const opened = await $.ui.open({ id: PANE, title: `Online agents (${list.length})`, focus: true, closeOnEscape: true })
+    if (opened.isPlaced) return {}
+    const table = agentTable(list, list[0]?.id ?? '', await $.env.get('HOME'), e.presentation?.columns ?? 80)
+    return { text: [`Online agents (${list.length})`, ...table].join('\n') }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const list = await read($, agents)
+    const width = e.props.bodyColumns || e.viewport?.columns || 80
+    const table = agentTable(list, list[0]?.id ?? '', await $.env.get('HOME'), width)
+    return (
+      <Box flexDirection="column">
+        <Text bold>Online agents ({list.length})</Text>
+        {table.map(row => (
+          <Text wrap="truncate-end">{row}</Text>
+        ))}
+      </Box>
+    )
   })
 
   // /clear and resume continue the process under another session ID.
   on('classic.SessionStart', async ($, e, next) => {
     const answered = await next(e)
-    await report($)
+    void report($)
     return answered
   })
 
   on('classic.PostModelSwitch', async ($, e, next) => {
     const answered = await next(e)
-    await report($)
+    void report($)
     return answered
   })
 
   on('turn.start', async ($, e, next) => {
     status = 'busy'
-    await report($)
+    void report($)
     return next(e)
   })
 
+  // A subagent's run raises no turn.start; its turn.complete is not the session's.
   on('turn.complete', async ($, e, next) => {
     const completed = await next(e)
     if (e.agentId !== undefined) return completed
     status = 'idle'
-    await report($)
+    void report($)
     return completed
-  })
-
-  on('session.compact', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
-    const before = status
-    status = 'busy'
-    await report($)
-    try {
-      return await next(e)
-    } finally {
-      status = before
-      await report($)
-    }
   })
 }

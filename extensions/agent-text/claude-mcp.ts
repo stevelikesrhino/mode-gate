@@ -9,7 +9,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { listen, MAX_TEXT_BYTES, privateDirectory, socketDirectory, type AgentInfo, type Receipt, type Request, type Response } from "./ipc.ts";
 import { agentList, discoverAgents, GUIDELINES, LIST_DESCRIPTION, messageText, sendText, TEXT_DESCRIPTION, textMessage } from "./messaging.ts";
-import { jobModel, ownerInfo, verifyRegistry } from "./claude-registry.ts";
+import { jobModel, ownerInfo, verifyRegistry, type OwnerInfo } from "./claude-registry.ts";
 
 type SessionState = { sessionId: string; cwd: string; model?: string; status: "idle" | "busy" };
 
@@ -207,7 +207,7 @@ async function main(): Promise<void> {
 				});
 				socket.end(`${auth}\n${frame}\n`, (error?: Error | null) => error ? fail() : finish({
 					status: "accepted",
-					reason: "Written to Claude inbox; inbound controls may hold or refuse it. Not confirmation of model processing.",
+					reason: "Write completed; not acknowledged by Claude. Inbound controls may hold or refuse it; not confirmation of model processing.",
 				}));
 			});
 			outgoing.signal.addEventListener("abort", abort, { once: true });
@@ -215,8 +215,20 @@ async function main(): Promise<void> {
 		});
 	}
 
-	async function info(owner: Awaited<ReturnType<typeof ownerInfo>>): Promise<AgentInfo> {
-		return { ...agent, ...state, name: owner.name ?? agent.name, model: state?.model ?? await jobModel(owner.jobId) };
+	// Claude's registry record is current after /clear and resume; the spawn-time
+	// environment and the mod's last report are fallbacks. A mod report for another
+	// session is stale, except its cwd: the registry holds the launch directory.
+	async function info(owner: OwnerInfo): Promise<AgentInfo> {
+		const sessionId = owner.sessionId ?? state?.sessionId ?? agent.sessionId;
+		const current = state?.sessionId === sessionId ? state : undefined;
+		return {
+			...agent,
+			sessionId,
+			cwd: state?.cwd || agent.cwd,
+			name: owner.name ?? agent.name,
+			model: current?.model ?? await jobModel(owner.jobId),
+			status: owner.status ?? current?.status ?? "unknown",
+		};
 	}
 
 	async function receive(value: unknown): Promise<Response> {
@@ -246,7 +258,11 @@ async function main(): Promise<void> {
 			.then(() => listenState(
 				join(states, basename(inbox)),
 				(value) => { state = value; },
-				async () => [await info(await ownerInfo(ownerPid, inbox)), ...await discoverAgents(directory, id, outgoing.signal)],
+				async () => {
+					const owner = await ownerInfo(ownerPid, inbox);
+					if (owner.reason) throw new Error(owner.reason);
+					return [await info(owner), ...await discoverAgents(directory, id, outgoing.signal)];
+				},
 			))
 			.then((stop) => { closeState = stop; })
 			.catch((error) => console.error(`agent-text: session state unavailable: ${error.message}`));
@@ -255,6 +271,7 @@ async function main(): Promise<void> {
 		{
 			name: "list_agent", description: `${LIST_DESCRIPTION} ${discoveryGuidance}`,
 			inputSchema: { type: "object", properties: {}, additionalProperties: false },
+			_meta: { "anthropic/alwaysLoad": true },
 		},
 		{
 			name: "text_agent", description: `${TEXT_DESCRIPTION} For Pi, non-Claude, and other agent-text peers, use this tool (mcp__agent-text__text_agent), not Claude's built-in SendMessage. Recipient IDs must come from this server's list_agent (mcp__agent-text__list_agent), not native ListAgent/ListAgents.`,
@@ -266,6 +283,7 @@ async function main(): Promise<void> {
 				},
 				required: ["ids", "text"], additionalProperties: false,
 			},
+			_meta: { "anthropic/alwaysLoad": true },
 		},
 	] }));
 	mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {

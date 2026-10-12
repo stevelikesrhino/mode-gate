@@ -6,7 +6,10 @@ import { join } from "node:path";
 type OwnerRecord = {
 	pid: number;
 	version: string;
+	peerProtocol: number;
 	kind: "interactive" | "bg";
+	sessionId?: unknown;
+	status?: unknown;
 	jobId?: string;
 	messagingSocketPath: string;
 	spare?: boolean;
@@ -23,6 +26,7 @@ async function readOwner(pid: number): Promise<OwnerRecord> {
 	const record = JSON.parse(await readFile(join(registryDirectory(), `${pid}.json`), "utf8"));
 	if (!record || record.pid !== pid
 		|| typeof record.version !== "string" || !/^\d+\.\d+\.\d+$/.test(record.version)
+		|| record.peerProtocol !== 1
 		|| (record.kind !== "interactive" && record.kind !== "bg")
 		|| typeof record.messagingSocketPath !== "string" || !record.messagingSocketPath
 		|| (record.spare !== undefined && typeof record.spare !== "boolean")
@@ -33,16 +37,21 @@ async function readOwner(pid: number): Promise<OwnerRecord> {
 	return record;
 }
 
-export async function ownerInfo(pid: number, inbox: string): Promise<{ reason?: string; jobId?: string; name?: string }> {
+export type OwnerInfo = { reason?: string; jobId?: string; name?: string; sessionId?: string; status?: "idle" | "busy" };
+
+export async function ownerInfo(pid: number, inbox: string): Promise<OwnerInfo> {
 	try {
 		const record = await readOwner(pid);
 		if (record.messagingSocketPath !== inbox) return { reason: "Claude owner record does not match this adapter's inbox." };
 		if (record.spare === true || record.parkedJobId !== undefined) return { reason: "Claude owner is a spare worker or parked launcher." };
 		// Derived and unsourced names are placeholders (agent-12, a job ID), not session titles.
 		const named = typeof record.name === "string" && !!record.name && typeof record.nameSource === "string" && record.nameSource !== "derived";
-		return { jobId: record.kind === "bg" ? record.jobId : undefined, name: named ? (record.name as string).slice(0, 120) : undefined };
+		// The record follows /clear and resume; the adapter's spawn-time environment does not.
+		const sessionId = typeof record.sessionId === "string" && record.sessionId && record.sessionId.length <= 128 ? record.sessionId : undefined;
+		const status = record.status === "idle" || record.status === "busy" ? record.status : undefined;
+		return { jobId: record.kind === "bg" ? record.jobId : undefined, name: named ? (record.name as string).slice(0, 120) : undefined, sessionId, status };
 	} catch {
-		return { reason: "Claude owner record is missing, unreadable, or incompatible. Run /agent-text setup-claude in Pi to check compatibility." };
+		return { reason: "Claude owner record is missing, unreadable, or incompatible. Run /agent-text hire-claude in Pi to check compatibility." };
 	}
 }
 
@@ -88,7 +97,7 @@ export async function verifyRegistry(version: string): Promise<void> {
 	try {
 		files = await readdir(registryDirectory());
 	} catch {
-		throw new Error("Cannot read Claude's session registry. Start Claude normally (not --bare), leave it running, then retry /agent-text setup-claude.");
+		throw new Error("Cannot read Claude's session registry. Start Claude normally (not --bare), leave it running, then retry /agent-text hire-claude.");
 	}
 	for (const file of files) {
 		if (!/^[1-9]\d*\.json$/.test(file)) continue;
@@ -101,5 +110,5 @@ export async function verifyRegistry(version: string): Promise<void> {
 			// Stale or incompatible records cannot establish compatibility.
 		}
 	}
-	throw new Error(`Cannot verify Claude ${version}'s session registry and messaging fields. Start that version normally (not --bare), leave it running, then retry /agent-text setup-claude. If it is already running, this adapter may need an update.`);
+	throw new Error(`Cannot verify Claude ${version}'s session registry and messaging fields. Start that version normally (not --bare), leave it running, then retry /agent-text hire-claude. If it is already running, this adapter may need an update.`);
 }

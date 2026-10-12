@@ -1,1 +1,1 @@
-{ "name": "agent-text-session", "version": "1.0.0", "description": "Reports this session's ID, model and activity to the agent-text adapter" }
+{ "name": "agent-text-session", "version": "1.1.0", "description": "Reports this session's ID, model and activity to the agent-text adapter", "author": { "name": "stevelikesrhino" }, "types": "./types/index.d.ts" }
