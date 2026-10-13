@@ -80,7 +80,7 @@ async function report($: EngineInterface, isRetry = false): Promise<void> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'agent-text', description: 'Show online Pi and Claude Code agents' })
+    await $.command.register({ name: 'agent-text', description: 'Show online Pi and Claude Code agents', immediate: true })
     const started = await next(e)
     void report($)
     return started
