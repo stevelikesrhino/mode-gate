@@ -103,7 +103,7 @@ for (const api of ["openai-completions", "anthropic-messages"]) {
 		assert.equal(f.http.length, 1);
 		const { body, headers } = f.http[0];
 		assert.deepEqual(body.tools, tools);
-		assert.equal(body.max_tokens, 8192);
+		assert.equal(body.max_tokens, f.ctx.model.maxTokens, "summary output is independent of reserve and retention settings");
 		assert.equal(body.stream, false);
 		assert.equal(body.stream_options, undefined);
 		assert.equal(headers.get("content-length"), null);
@@ -168,25 +168,28 @@ test("Chat completion caps replace the live cap without sending both cap fields"
 	assert.equal(f.http[0].body.max_tokens, undefined);
 });
 
-test("invalid capture, divergence, tool choice, image policy, and abort fail before HTTP", async t => {
+test("uncertain cache alignment warns once and reconstructs instead of cancelling", async t => {
 	const f = fixture(t);
-	for (const change of [
-		() => f.emit("before_provider_request", { payload: null }),
-		() => { f.event.preparation.messagesToSummarize = [{ ...f.user, content: "different" }, f.assistant]; },
-		() => f.emit("before_provider_request", { payload: { ...f.payload, tool_choice: "required" } }),
-		() => { f.state.settings = { images: { blockImages: true } }; return f.emit("before_provider_request", { payload: { ...f.payload,
-			messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "fixture" } }] }] } }); },
-		() => { f.event.signal = AbortSignal.abort(); },
+	const warnings = [];
+	f.ctx.hasUI = true;
+	f.ctx.ui = { notify: message => warnings.push(message) };
+	for (const payload of [
+		null,
+		{ ...f.payload, messages: [{ role: "user", content: "Divergent capture" }] },
+		{ ...f.payload, tool_choice: "required" },
+		{ ...f.payload, messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "fixture" } }] }] },
 	]) {
-		f.state.settings = {};
-		f.event.signal = new AbortController().signal;
-		f.event.preparation.messagesToSummarize = [f.user, f.assistant];
-		await f.capture();
-		await change();
-		assert.deepEqual(await f.run(), { cancel: true });
+		f.state.settings = { images: { blockImages: true } };
+		await f.capture(payload);
+		assert.ok((await f.run()).compaction);
 	}
-	assert.equal(f.http.length, 0);
-	assert.equal(f.sdk.length, 0, "invalid capture never becomes reconstruction");
+	assert.equal(f.http.length, 0, "untrusted captured payloads are never replayed");
+	assert.equal(f.sdk.length, 4);
+	assert.equal(warnings.length, 4);
+	assert.ok(warnings.every(message => /Cache reuse is uncertain; this may cost more/.test(message)));
+	f.event.signal = AbortSignal.abort();
+	await assert.rejects(() => f.run(), /abort/i);
+	assert.equal(f.sdk.length, 4, "abort does not start reconstruction");
 });
 
 test("tool IDs may normalize, but the cut cannot contain an unfinished tool turn", async t => {
@@ -202,7 +205,7 @@ test("tool IDs may normalize, but the cut cannot contain an unfinished tool turn
 	assert.ok((await f.run()).compaction);
 	assert.deepEqual(f.http[0].body.messages.slice(0, -1), payload.messages.slice(0, -1));
 	f.event.preparation.messagesToSummarize = [f.user, call];
-	assert.deepEqual(await f.run(), { cancel: true });
+	await assert.rejects(() => f.run(), /does not match|unfinished tool turn/);
 	assert.equal(f.http.length, 1);
 });
 
@@ -216,81 +219,64 @@ test("HTTP errors, tool output, empty text, and truncated summaries never create
 		f.success("length"),
 	]) {
 		f.responses.push(response);
-		assert.deepEqual(await f.run(), { cancel: true });
+		await assert.rejects(() => f.run());
 	}
 	assert.equal(f.http.length, 4);
 });
 
-test("limit recovery moves the cut earlier, adds usage, and stops for exhausted or edited history", async t => {
+test("limit backoff uses edited history, sums usage, and stops when no earlier cut remains", async t => {
 	const f = fixture(t);
-	const messages = Array.from({ length: 48 }, (_, i) => i % 2
+	const history = Array.from({ length: 48 }, (_, i) => i % 2
 		? { ...f.assistant, content: [{ type: "text", text: "y".repeat(4000) }], timestamp: i }
 		: { ...f.user, content: "x".repeat(4000), timestamp: i });
-	const branch = messages.map(entry);
-	const settings = f.event.preparation.settings;
-	const preparation = prepareCompaction(branch, settings);
-	const event = { ...f.event, branchEntries: branch, preparation };
-	await f.capture({ ...f.payload, messages: [f.payload.messages[0], ...f.wire(messages)] }, messages);
+	f.branch.splice(0, f.branch.length, ...history.map(entry));
+	f.branch.push({ type: "context_edit", id: "cached-edit", parentId: "e47", timestamp: new Date(49).toISOString(), targetId: "e0", replacement: { content: "EDITED-CACHED-CONTENT " + "x".repeat(4000) } },
+		{ type: "context_edit", id: "cached-omit", parentId: "cached-edit", timestamp: new Date(50).toISOString(), targetId: "e1", replacement: null });
+	const visible = [{ ...history[0], content: "EDITED-CACHED-CONTENT " + "x".repeat(4000) }, ...history.slice(2)];
+	const cachedEvent = { ...f.event, preparation: prepareCompaction(f.branch, f.event.preparation.settings) };
+	await f.capture({ ...f.payload, messages: [f.payload.messages[0], ...f.wire(visible)] }, visible);
 	for (const failure of [f.success("length"), new Response('{"error":{"code":"context_length_exceeded","message":"Maximum context length exceeded"}}', { status: 400 })]) {
 		f.http.length = 0;
 		f.responses.push(failure, f.success());
-		const result = await f.run(event);
-		assert.equal(result.compaction.firstKeptEntryId, prepareCompaction(branch, { ...settings, keepRecentTokens: 16384 }).firstKeptEntryId);
-		assert.equal(result.compaction.usage.output, failure instanceof Response ? 20 : 40);
-		assert.equal(result.compaction.details.budget.keepRecentTokens, 16384, "metadata uses the successful retry's budget");
-		assert.deepEqual(f.http.map(call => call.body.max_tokens), [8192, 16384]);
-		const [first, second] = f.http.map(call => call.body.messages);
-		assert.ok(second.length < first.length);
-		assert.deepEqual(second.slice(0, -1), first.slice(0, second.length - 1));
+		const cached = await f.run(cachedEvent);
+		assert.equal(f.http.length, 2, "retry the shorter captured prefix");
+		assert.equal(f.sdk.length, 0, "matching capture does not need reconstruction");
+		assert.equal(cached.compaction.firstKeptEntryId, prepareCompaction(f.branch, { ...f.event.preparation.settings, keepRecentTokens: 16384 }).firstKeptEntryId);
+		assert.equal(cached.compaction.usage.output, failure instanceof Response ? usage.output : usage.output * 2);
+		assert.ok(f.http[1].body.messages.length < f.http[0].body.messages.length);
+		assert.deepEqual(f.http.map(call => call.body.max_tokens), [f.ctx.model.maxTokens, f.ctx.model.maxTokens]);
+		assert.ok(f.http[1].body.messages.some(message => typeof message.content === "string" && message.content.includes("EDITED-CACHED-CONTENT")));
 	}
 	f.http.length = 0;
-	f.responses.push(...Array.from({ length: 5 }, () => f.success("length")));
-	assert.deepEqual(await f.run({ ...event, preparation: prepareCompaction(branch, { ...settings, keepRecentTokens: 1024 }) }), { cancel: true });
-	assert.equal(f.http.length, 5, "at most four limit retries");
-	f.http.length = 0;
-	f.responses.push(f.success("length"));
-	assert.deepEqual(await f.run({ ...event, branchEntries: [...branch, { type: "context_edit" }] }), { cancel: true });
-	assert.equal(f.http.length, 1, "never select a raw-entry retry cut around edits");
+	f.responses.push(...Array.from({ length: 64 }, () => f.success("length")));
+	await assert.rejects(() => f.run(cachedEvent), /cached backoff exhausted/);
+	assert.ok(f.http.length > 1, "try earlier cuts before yielding to the dispatcher");
+	assert.equal(f.sdk.length, 0, "no standalone summarizer");
 });
 
-for (const [name, mode, reconstruct] of [
-	["DeepSeek reports Esc as error", "abort", true],
-	["explicit aborted assistant", "assistant-abort", true],
-	["payload hook failed", "invalid-payload", false],
-	["payload observed without headers", "no-headers", false],
-	["context cloning failed", "clone-failed", false],
-	["full context missing", "no-full", false],
-	["not aborted", "active", false],
-]) {
-	test(`capture lifecycle: ${name}`, async t => {
-		const f = fixture(t);
-		await f.emit("context", { messages: mode === "clone-failed" ? [() => {}] : f.messages });
-		if (mode !== "no-full") await f.emit("context_with_system", { messages: [f.system, ...f.messages] });
-		if (mode === "invalid-payload" || mode === "no-headers") await f.emit("before_provider_request", { payload: mode === "invalid-payload" ? null : f.payload });
-		if (mode !== "active" && mode !== "assistant-abort") f.ctx.signal = AbortSignal.abort();
-		await f.emit("agent_end", { messages: [{ ...f.assistant, stopReason: mode === "assistant-abort" ? "aborted" : "error" }] });
-		const result = await f.run();
-		assert.equal(!!result.compaction, reconstruct);
-		assert.equal(f.sdk.length, reconstruct ? 1 : 0);
-		assert.equal(f.http.length, 0);
-	});
-}
+test("missing capture reconstructs; an unapplied model switch yields to the dispatcher", async t => {
+	const f = fixture(t);
+	assert.ok((await f.run()).compaction);
+	await f.capture();
+	f.ctx.model = { ...f.ctx.model, id: "other-model" };
+	await assert.rejects(() => f.run(), /no applied saved prompt/);
+	assert.equal(f.sdk.length, 1);
+	assert.equal(f.http.length, 0, "never replay another model's captured request");
+});
 
-test("complete capture survives Esc; session start, tree change, and shutdown invalidate it", async t => {
+test("successful compaction and session changes invalidate captures", async t => {
 	const f = fixture(t);
 	await f.capture();
-	f.ctx.signal = AbortSignal.abort();
-	await f.emit("agent_end", { messages: [{ ...f.assistant, stopReason: "error" }] });
 	f.responses.push(f.success());
 	assert.ok((await f.run()).compaction);
 	assert.equal(f.http.length, 1);
 	assert.equal(f.sdk.length, 0);
-	for (const name of ["session_start", "session_tree", "session_shutdown"]) {
+	for (const name of ["session_start", "session_compact", "session_tree", "session_shutdown"]) {
 		await f.capture();
 		await f.emit(name, {});
 		assert.ok((await f.run()).compaction);
 	}
-	assert.equal(f.sdk.length, 3);
+	assert.equal(f.sdk.length, 4);
 	assert.equal(f.http.length, 1);
 	assert.equal(f.handlers.session_before_tree, undefined, "Pi still owns branch summarization");
 });
@@ -324,11 +310,11 @@ test("reconstruction uses edited history and saved prompt/tools, including later
 	assert.match(body.messages.at(-1).content, /Do not call any tools/);
 	assert.deepEqual(f.branch, original);
 	f.branch.push({ type: "model_change", id: "switch", parentId: "edit", timestamp: new Date(6).toISOString(), provider: f.ctx.model.provider, modelId: f.ctx.model.id });
-	assert.deepEqual(await f.run(), { cancel: true }, "unapplied model switch must not guess prompt state");
+	await assert.rejects(() => f.run(), /no applied saved prompt/, "unapplied model switch yields to native rather than guessing prompt state");
 	assert.equal(f.sdk.length, 1);
 });
 
-test("Responses serializer proves the captured prefix; unsupported output or divergent wire cancels", async t => {
+test("Responses verifies captured prefixes, rejects refusals, and reconstructs divergent wire", async t => {
 	const f = fixture(t, "openai-responses");
 	f.ctx.modelRegistry.streamSimple = (model, context, options) => responsesStream(model, context, { ...options, apiKey: "sk-offline-fixture" });
 	let payload;
@@ -356,8 +342,10 @@ test("Responses serializer proves the captured prefix; unsupported output or div
 	assert.equal(body.store, false);
 	assert.equal(body.stream, true);
 	f.responses.push(response([{ type: "response.refusal.delta", delta: "Refused" }]));
-	assert.deepEqual(await f.run(), { cancel: true });
+	await assert.rejects(() => f.run(), /refusal/);
 	await f.capture({ ...payload, input: [{ role: "user", content: "Divergent" }] });
-	assert.deepEqual(await f.run(), { cancel: true });
-	assert.equal(f.http.length, 2, "divergent wire is rejected before HTTP");
+	f.responses.push(response());
+	assert.ok((await f.run()).compaction);
+	assert.equal(f.http.length, 3, "divergent wire is replaced with a reconstructed request");
+	assert.ok(!JSON.stringify(f.http.at(-1).body).includes("Divergent"));
 });

@@ -20,6 +20,7 @@ const pi = {
 	on(name, fn) { (handlers[name] ??= []).push(fn); },
 	registerEntryRenderer(name, fn) { renderers[name] = fn; },
 	getSettings: () => ({}),
+	getThinkingLevel: () => "off",
 	getAllTools: () => [],
 	getActiveTools: () => [],
 	appendEntry: () => {},
@@ -45,7 +46,10 @@ const ctx = {
 	model,
 	mode: "print", hasUI: false,
 	sessionManager: { getSessionId: () => "combined-test", getBranch: () => branch },
-	modelRegistry: { getApiKeyAndHeaders: async () => { authCalls++; return { ok: true, apiKey: jwt, baseUrl: "https://proxy.example/codex" }; } },
+	modelRegistry: {
+		getApiKeyAndHeaders: async () => { authCalls++; return { ok: true, apiKey: jwt, baseUrl: "https://proxy.example/codex" }; },
+		streamSimple: () => { throw new Error("Unexpected SDK request"); },
+	},
 	getSystemPrompt: () => "Test system prompt",
 	abort: () => { aborted++; },
 };
@@ -262,13 +266,23 @@ assert.equal(result.compaction.usage.cacheRead, 950);
 assert.equal(result.compaction.firstKeptEntryId, prep.firstKeptEntryId);
 assert.equal(calls.at(-1).body.tool_choice, undefined);
 assert.equal(calls.at(-1).body.input, undefined);
-respond = () => new Response("bad request", { status: 400 });
-assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), regularCtx), { cancel: true }, "text failures cancel without native fallback");
+const successfulResponse = respond;
+for (const response of [
+	() => new Response("bad request", { status: 400 }),
+	() => Response.json({ choices: [{ message: { content: "Partial summary" }, finish_reason: "length" }] }),
+]) {
+	respond = response;
+	assert.equal(await handlers.session_before_compact[0](compactEvent(), regularCtx), undefined, "errors and exhausted limits yield to Pi's native summary");
+}
+respond = successfulResponse;
+await capture(chat, regularCtx);
+assert.ok((await handlers.session_before_compact[0](compactEvent(), regularCtx)).compaction, "fallback is not sticky: next operation tries cache again");
+assert.deepEqual(await handlers.session_before_compact[0]({ ...compactEvent(), signal: AbortSignal.abort() }, regularCtx), { cancel: true }, "user abort never starts native fallback");
 
 const beforeExcluded = calls.length;
 const beforeAuth = authCalls;
 for (const api of ["openai-completions", "openai-responses"]) {
-	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), { cancel: true });
+	assert.equal(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), undefined, "missing capture and saved prompt yield to Pi");
 }
 assert.equal(calls.length, beforeExcluded);
 assert.equal(authCalls, beforeAuth);
@@ -296,16 +310,16 @@ for (const oldCheckpoint of [checkpoint, { ...checkpoint, details: { ...checkpoi
 	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), publicCtx), { cancel: true });
 	assert.equal(calls.length, beforeNetwork, "Opaque history never reaches the public text path");
 }
-// Unexpected adapter errors must not be swallowed into Pi's native summarizer.
+// Failures before the opaque-history guard completes must still fail closed.
 branch = regularBranch;
 const throwingEvent = { ...compactEvent(), get signal() { throw new Error("unexpected adapter failure"); } };
 const diagnostics = [];
 assert.deepEqual(await handlers.session_before_compact[0](throwingEvent, { ...regularCtx, hasUI: true,
 	ui: { notify: message => diagnostics.push(message) } }), { cancel: true });
-assert.match(diagnostics[0], /unexpected compaction error: unexpected adapter failure/);
+assert.match(diagnostics[0], /Compaction cancelled: unexpected adapter failure/);
 assert.deepEqual(await handlers.session_before_compact[0](throwingEvent, { ...regularCtx, hasUI: true,
 	ui: { notify() { throw new Error("UI unavailable"); } } }), { cancel: true });
-assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...regularCtx, model: { ...regularCtx.model, api: "unsupported" } }), { cancel: true });
+assert.equal(await handlers.session_before_compact[0](compactEvent(), { ...regularCtx, model: { ...regularCtx.model, api: "unsupported" } }), undefined, "unsupported cache APIs yield to Pi");
 for (const api of ["openai-completions", "anthropic-messages"]) {
 	branch = [...regularBranch, checkpoint];
 	const before = calls.length;
@@ -357,4 +371,4 @@ await emitStats();
 for (const fn of handlers.session_shutdown) await fn({}, statsCtx);
 await tick();
 assert.equal(appended.length, 1, "stale checkpoint, session replacement, and shutdown suppress pending stats");
-console.log("Combined dispatcher, fail-closed errors, Codex replay, opaque guards, provider isolation, branch-summary, and stats tests passed.");
+console.log("Combined dispatcher, native fallback, Codex replay, opaque guards, branch-summary, and stats tests passed.");

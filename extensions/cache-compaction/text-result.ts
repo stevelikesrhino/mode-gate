@@ -21,11 +21,10 @@ interface TextCompactionDetails {
 	budget: CompactionBudget;
 }
 
-export function summaryOutputTokens(model: Model, settings: Preparation["settings"], thinkingTokens = 0): number {
-	// Ignore the live request's potentially clamped output cap. Retaining more
-	// history shortens the summary prefix and increases its output allowance.
-	const summaryTokens = Math.max(8192, settings.keepRecentTokens, settings.reserveTokens);
-	return Math.max(1, Math.min(summaryTokens + thinkingTokens, model.maxTokens > 0 ? model.maxTokens : Infinity));
+export function summaryOutputTokens(model: Model): number {
+	// No summary-specific ceiling. The SDK fits the model's output maximum to
+	// available context; a length stop retries with a shorter history prefix.
+	return model.maxTokens > 0 ? model.maxTokens : model.contextWindow;
 }
 
 export function createTextCompaction(preparation: Preparation, model: Model, summary: Summary): CompactionResult<TextCompactionDetails> {

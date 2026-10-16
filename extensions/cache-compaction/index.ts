@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerCodexCompaction } from "./codex/extension.ts";
 import { findNativeCheckpoint, isOpenAICodexModel } from "./codex/native-compaction.ts";
-import registerTextCompaction, { cancelCompaction } from "./text-compaction.ts";
+import registerTextCompaction, { warnCompaction } from "./text-compaction.ts";
 import registerCompactionStats from "./stats.ts";
 
 /** One owner for compaction; branch summarization remains pi's responsibility. */
@@ -29,17 +29,28 @@ export default function cacheCompaction(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		// An absent result or escaped error must never invoke Pi's summarizer.
+		// Only ordinary text history may fall through to Pi's native summarizer.
+		let nativeFallback = false;
+		let signal: AbortSignal | undefined;
 		try {
+			signal = event.signal;
+			if (signal.aborted || !ctx.model) return { cancel: true };
 			const codex = isOpenAICodexModel(ctx.model);
 			if (!codex && findNativeCheckpoint(event.branchEntries).status !== "none") {
 				notifyOpaque(ctx);
 				return { cancel: true };
 			}
-			const result = await (codex ? compactCodex(event, ctx) : compactText(event, ctx));
-			return result?.compaction ? result : { cancel: true };
+			if (codex) return await compactCodex(event, ctx) ?? { cancel: true };
+			nativeFallback = true;
+			return await compactText(event, ctx);
 		} catch (error) {
-			return cancelCompaction(ctx, `unexpected compaction error: ${error instanceof Error ? error.message : String(error)}`);
+			if (signal?.aborted) return { cancel: true };
+			const reason = error instanceof Error ? error.message : String(error);
+			warnCompaction(ctx, nativeFallback
+				? `Using Pi's native summary for this compaction: ${reason}`
+				: `Compaction cancelled: ${reason}`);
+			// No persistent fallback mode: every event starts with the cache route.
+			return nativeFallback ? undefined : { cancel: true };
 		}
 	});
 }

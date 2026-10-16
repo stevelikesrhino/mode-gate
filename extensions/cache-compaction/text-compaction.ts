@@ -14,17 +14,18 @@
  * - Legacy openai-codex compaction remains owned by its checkpoint reader.
  * - Branch summarization stays native; tree navigation only invalidates capture.
  * - openai-completions, openai-responses, and anthropic-messages are supported;
- *   anything else cancels compaction.
+ *   other APIs use Pi's native summary.
  *
  * Missing capture is reconstructed from projected conversation and prompt state.
  * Request-only extension transforms are not replayed during reconstruction.
- * Limit failures retry with doubled recent-history retention and a shorter
- * cached prefix. Other failures or exhausted retries cancel compaction.
+ * Limit failures double retained history and retry a shorter cached prefix.
+ * Unverifiable captures use saved-state reconstruction with a cost warning.
+ * Failed or exhausted attempts yield to Pi's native summary for this operation.
  * Saved history and persistent settings are unchanged until a summary succeeds.
  * Failed attempts can still add latency and cost.
  */
 
-import { buildSessionProjection, convertToLlm, findCutPoint, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, convertToLlm, findCutPoint, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBeforeCompactResult, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { isContextOverflow, type Usage } from "@earendil-works/pi-ai";
 import fs from "node:fs";
 import { findNativeCheckpoint } from "./codex/native-compaction.ts";
@@ -128,8 +129,7 @@ const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response 
 const REQUEST_TIMEOUT_MS = 900_000;
 const RETRY_DELAY_MS = 2_000;
 const MAX_ATTEMPTS = 2;
-const MAX_LIMIT_RETRIES = 4;
-// Whole compaction, so a transport retry is not starved by its predecessor.
+// Bound cache attempts independently of Pi's eventual native fallback.
 const COMPACTION_TIMEOUT_MS = REQUEST_TIMEOUT_MS * MAX_ATTEMPTS;
 
 function requestSignal(signal: AbortSignal | null | undefined): AbortSignal {
@@ -140,6 +140,8 @@ function requestSignal(signal: AbortSignal | null | undefined): AbortSignal {
 // Resolve fetch per call so test stubs of globalThis.fetch still apply.
 const timedFetch: typeof globalThis.fetch = (input, init) =>
 	globalThis.fetch(input, { ...init, signal: requestSignal(init?.signal) });
+
+class CacheAlignmentError extends Error {}
 
 class CompactionLimitError extends Error {
 	constructor(message: string, readonly usage?: Usage) {
@@ -177,26 +179,22 @@ function isContextLimitError(status: number, text: string, model: NonNullable<Ex
 }
 
 function prepareRetry(event: SessionBeforeCompactEvent, keepRecentTokens: number): SessionBeforeCompactEvent["preparation"] | undefined {
-	const entries = event.branchEntries;
-	// Pi's public cut selector reads raw entries, not the edited projection.
-	// Cancel edit-aware limit recovery rather than guessing a raw-entry cut.
-	if (entries.some((entry) => entry.type === "context_edit")) return undefined;
-	const previousIndex = entries.findLastIndex((entry) => entry.type === "compaction");
-	const previous = entries[previousIndex];
-	const keptIndex = previous?.type === "compaction" ? entries.findIndex((entry) => entry.id === previous.firstKeptEntryId) : -1;
-	const start = keptIndex >= 0 ? keptIndex : previousIndex + 1;
-	// prepareCompaction is not exported by pi; use its public cut selector and
-	// entry conversion, preserving the original summary and token accounting.
-	const cut = findCutPoint(entries, start, entries.length, keepRecentTokens);
+	// Feed Pi's cut selector the edited projection, not raw session entries.
+	// Non-compaction entries contribute at most one conversation message;
+	// preserve its source ID so the successful cut remains a real session ID.
+	const entries: SessionEntry[] = buildSessionProjection(event.branchEntries).entries.flatMap(({ sourceEntry, messages }) =>
+		sourceEntry.type === "compaction" ? [] : messages
+			.filter((message) => message.role !== "system" && message.role !== "compactionSummary" && !isOmittedAssistant(message))
+			.map((message) => ({ ...sourceEntry, type: "message" as const, message })),
+	);
+	if (!entries.length) return undefined;
+	const cut = findCutPoint(entries, 0, entries.length, keepRecentTokens);
 	const firstKeptEntryId = entries[cut.firstKeptEntryIndex]?.id;
-	if (!firstKeptEntryId) return undefined;
-	const messages = (from: number, to: number) => entries.slice(from, to).flatMap((entry) => {
-		if (entry.type === "compaction") return [];
-		return sessionEntryToContextMessages(entry).filter((message) => message.role !== "system");
-	});
-	const messagesToSummarize = messages(start, cut.isSplitTurn ? cut.turnStartIndex : cut.firstKeptEntryIndex);
-	const turnPrefixMessages = cut.isSplitTurn ? messages(cut.turnStartIndex, cut.firstKeptEntryIndex) : [];
-	if (!messagesToSummarize.length && !turnPrefixMessages.length) return undefined;
+	const conversation = entries.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+	const historyEnd = cut.isSplitTurn ? cut.turnStartIndex : cut.firstKeptEntryIndex;
+	const messagesToSummarize = conversation.slice(0, historyEnd);
+	const turnPrefixMessages = cut.isSplitTurn ? conversation.slice(cut.turnStartIndex, cut.firstKeptEntryIndex) : [];
+	if (!firstKeptEntryId || (!messagesToSummarize.length && !turnPrefixMessages.length)) return undefined;
 	return {
 		...event.preparation,
 		firstKeptEntryId,
@@ -253,10 +251,6 @@ type ReadyCapture = CapturedRequest & {
 
 function isReadyCapture(captured: CapturedRequest): captured is ReadyCapture {
 	return captured.payload.state === "captured" && captured.headers !== undefined && captured.contextMessages !== undefined;
-}
-
-function canDiscardAbortedCapture(captured: CapturedRequest): boolean {
-	return captured.payload.state === "pending" && captured.contextMessages !== undefined && captured.fullContextMessages !== undefined;
 }
 
 function isExcludedProvider(model: { provider: string }): boolean {
@@ -482,14 +476,13 @@ function findWireCut(context: ReturnType<typeof convertToLlm>, messages: JsonObj
 	return wire === messages.length ? cut : undefined;
 }
 
-export function cancelCompaction(ctx: ExtensionContext, reason: string): SessionBeforeCompactResult {
-	log({ ev: "cancel", reason });
+export function warnCompaction(ctx: ExtensionContext, message: string): void {
+	log({ ev: "warning", message });
 	try {
-		if (ctx.hasUI) ctx.ui.notify(`Cache-aligned compaction cancelled: ${reason}`, "warning");
+		if (ctx.hasUI) ctx.ui.notify(message, "warning");
 	} catch {
-		// Notification failures must not enable native compaction.
+		// Display failures must not change compaction routing.
 	}
-	return { cancel: true };
 }
 
 function validateToolBoundary(messages: ReturnType<typeof convertToLlm>): void {
@@ -518,6 +511,7 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 	const model = ctx.model!;
 	validateToolBoundary(messages);
 	let invalidOutput = false;
+	let alignmentError: CacheAlignmentError | undefined;
 	const checkOutput = (item: unknown): void => {
 		if (!isJsonObject(item) || !["message", "reasoning"].includes(item.type) ||
 			(item.type === "message" && Array.isArray(item.content) && item.content.some((block: any) => block?.type !== "output_text"))) invalidOutput = true;
@@ -530,7 +524,13 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 		...(thinking && thinking !== "off" ? { reasoning: thinking, thinkingBudgets: pi?.getSettings().thinkingBudgets } : {}),
 		onPayload: (generated) => {
 			signal.throwIfAborted();
-			return onPayload(generated);
+			try {
+				return onPayload(generated);
+			} catch (error) {
+				// SDK streams normalize hook exceptions into error responses.
+				if (error instanceof CacheAlignmentError) alignmentError = error;
+				throw error;
+			}
 		},
 		onProviderStreamEvent: (data) => {
 			if (!isJsonObject(data)) return;
@@ -542,12 +542,13 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 	}).result();
 	signal.throwIfAborted();
 	log({ ev: "usage", usage: result.usage });
+	if (alignmentError) throw alignmentError;
 	if (invalidOutput || result.content.some((block) => block.type === "toolCall")) throw new Error("summary emitted a tool call, refusal, or unsupported output");
 	if (result.stopReason === "length" || isContextOverflow(result, model.contextWindow)) {
 		throw new CompactionLimitError(`summary reached limit: ${result.rawStopReason ?? result.stopReason}`, result.usage);
 	}
-	const normal = model.api === "openai-responses" ? ["completed"] : model.api === "anthropic-messages" ? ["end_turn", "stop_sequence"] : ["stop"];
-	if (result.stopReason !== "stop" || !normal.includes(result.rawStopReason!)) throw new Error(result.errorMessage ?? `summary did not finish normally: ${result.rawStopReason ?? result.stopReason}`);
+	// The SDK owns provider-specific finish-reason normalization.
+	if (result.stopReason !== "stop") throw new Error(result.errorMessage ?? `summary did not finish normally: ${result.rawStopReason ?? result.stopReason}`);
 	const text = stripCodeFences(result.content.filter((block) => block.type === "text").map((block) => block.text).join(""));
 	if (!text) throw new Error("empty summary");
 	return { text, usage: result.usage };
@@ -568,13 +569,13 @@ async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeComp
 	const previous = prefix.filter((message) => message.role === "compactionSummary");
 	if (previous.length !== (event.preparation.previousSummary === undefined ? 0 : 1) ||
 		(previous[0]?.role === "compactionSummary" && previous[0].summary !== event.preparation.previousSummary)) throw new Error("reconstructed previous summary does not match");
-	if (!prefix.some((message) => message.role === "system")) throw new Error("no saved system prompt; make a live request before compacting");
+	if (!prefix.some((message) => message.role === "system")) throw new Error("no saved system prompt for cache reconstruction");
 	// A switch before before_agent_start has not applied model-system-prompt yet.
 	const lastModel = projection.model;
-	if (lastModel && (lastModel.provider !== ctx.model!.provider || lastModel.modelId !== ctx.model!.id)) throw new Error("model prompt is not applied; make a live request with the selected model first");
+	if (lastModel && (lastModel.provider !== ctx.model!.provider || lastModel.modelId !== ctx.model!.id)) throw new Error("selected model has no applied saved prompt for cache reconstruction");
 	const lastSwitch = event.branchEntries.findLastIndex((entry) => entry.type === "model_change");
 	if (lastSwitch >= 0 && !event.branchEntries.slice(lastSwitch + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant" &&
-		entry.message.provider === ctx.model!.provider && entry.message.model === ctx.model!.id)) throw new Error("model prompt is not applied; make a live request with the selected model first");
+		entry.message.provider === ctx.model!.provider && entry.message.model === ctx.model!.id)) throw new Error("selected model has no applied saved prompt for cache reconstruction");
 	const blockImages = pi.getSettings().images?.blockImages;
 	const filtered = blockImages ? prefix.map((message) => {
 		if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) return message;
@@ -583,7 +584,7 @@ async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeComp
 				blocks[index - 1].type === "text" && (blocks[index - 1] as { text: string }).text === block.text)) };
 	}) : prefix;
 	const model = ctx.model!;
-	const maxTokens = summaryOutputTokens(model, event.preparation.settings);
+	const maxTokens = summaryOutputTokens(model);
 	const instruction = buildInstruction(event.preparation.previousSummary, event.customInstructions);
 	return summarizeSdk(ctx, convertToLlm(filtered), maxTokens, event.signal, (generated) => {
 		if (!isJsonObject(generated)) throw new Error("invalid reconstructed payload");
@@ -604,15 +605,15 @@ async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture,
 	if (payload.previous_response_id !== undefined || payload.conversation !== undefined || payload.context_management !== undefined ||
 		!Array.isArray(input) || input.some((item) => !isJsonObject(item) ||
 			(item.type !== undefined ? !knownTypes.has(item.type) : !["user", "assistant", "system", "developer"].includes(item.role)))) {
-		throw new Error("Responses history cannot be verified for cache-aligned compaction");
+		throw new CacheAlignmentError("Responses history cannot be verified for cache-aligned compaction");
 	}
 	if (payload.tool_choice !== undefined && payload.tool_choice !== "auto" && payload.tool_choice !== "none") {
-		throw new Error("summary requires an unforced tool choice");
+		throw new CacheAlignmentError("summary requires an unforced tool choice");
 	}
 	const full = captured.fullContextMessages?.filter((message) => !isOmittedAssistant(message));
 	const visible = (messages: unknown[]) => messages.filter((message) => !(isJsonObject(message) && message.role === "system"));
 	if (!full || !deepEqual(visible(full), visible(captured.contextMessages.filter((message) => !isOmittedAssistant(message))))) {
-		throw new Error("Responses full transcript does not match the captured conversation");
+		throw new CacheAlignmentError("Responses full transcript does not match the captured conversation");
 	}
 	const prefix: Conversation = [];
 	let seen = 0;
@@ -625,7 +626,7 @@ async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture,
 	// beyond the conversation cut. Unknown/noncontiguous state needs a new cut,
 	// not an unchecked reconstruction around the captured request.
 	const systems = (messages: unknown[]) => messages.filter((message) => isJsonObject(message) && message.role === "system");
-	if (!deepEqual(systems(prefix), systems(full))) throw new Error("captured prefix would omit saved prompt/tool updates");
+	if (!deepEqual(systems(prefix), systems(full))) throw new CacheAlignmentError("captured prefix would omit saved prompt/tool updates");
 	const context = { messages: convertToLlm(prefix) };
 	const headers: Record<string, string> = {};
 	for (const [key, value] of Object.entries(captured.headers)) {
@@ -636,11 +637,11 @@ async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture,
 	}
 	return summarizeSdk(ctx, context.messages, maxTokens, signal, (generated) => {
 		// Use the same SDK serializer to prove the cut, then send the original
-		// captured items, not the reserialized copies. Unknown transforms cancel
-		// before any HTTP request is made.
+		// captured items, not the reserialized copies. Unknown transforms switch
+		// to saved-state reconstruction before any HTTP request is made.
 		if (!isJsonObject(generated) || !Array.isArray(generated.input) || generated.input.length === 0 ||
 			!deepEqual(generated.input, input.slice(0, generated.input.length))) {
-			throw new Error("Responses wire prefix does not match the compaction boundary");
+			throw new CacheAlignmentError("Responses wire prefix does not match the compaction boundary");
 		}
 		const body: JsonObject = { ...payload, input: [...input.slice(0, generated.input.length), { role: "user", content: instruction }], stream: true, store: false };
 		// The SDK omits unsupported output caps for ChatGPT token sharing.
@@ -722,7 +723,7 @@ async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: Exte
 	const isAnthropic = model.api === "anthropic-messages";
 	const preCutCount = convertToLlm(prefix).length;
 	const cutIndex = findWireCut(convertToLlm(context), messages, preCutCount, isAnthropic);
-	if (cutIndex === undefined) throw new Error("wire boundary does not match the selected prefix");
+	if (cutIndex === undefined) throw new CacheAlignmentError("wire boundary does not match the selected prefix");
 	const instruction = buildInstruction(prep.previousSummary, event.customInstructions);
 	const instructionMessage = {
 		role: "user",
@@ -734,9 +735,8 @@ async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: Exte
 		stream: false,
 	};
 	delete body.stream_options;
-	// Preserve explicit Anthropic thinking settings and their output allowance.
-	const thinkingTokens = isAnthropic && body.thinking?.type === "enabled" ? body.thinking.budget_tokens : 0;
-	const maxTokens = summaryOutputTokens(model, prep.settings, thinkingTokens);
+	// Preserve explicit thinking settings, within the model's full output limit.
+	const maxTokens = summaryOutputTokens(model);
 	if (!isAnthropic && body.max_completion_tokens !== undefined) {
 		body.max_completion_tokens = maxTokens;
 		delete body.max_tokens;
@@ -747,7 +747,7 @@ async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: Exte
 	const toolChoice = body.tool_choice;
 	if (toolChoice !== undefined && toolChoice !== "auto" && toolChoice !== "none" &&
 		!(isAnthropic && (toolChoice?.type === "auto" || toolChoice?.type === "none"))) {
-		throw new Error("captured request forces tool selection");
+		throw new CacheAlignmentError("captured request forces tool selection");
 	}
 
 	// SDK clients apply authentication after the headers hook. Resolve current
@@ -835,7 +835,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 			capturedBySession.delete(sessionId);
 			return undefined;
 		}
-		// Preserve failed-capture state so it cannot masquerade as a clean reload.
+		// Clear any older payload before capturing this request.
 		existing.payload = { state: "failed" };
 		if (!isJsonObject(event.payload)) return undefined;
 		try {
@@ -870,140 +870,107 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 		capturedBySession.delete(ctx.sessionManager.getSessionId());
 	};
 	pi.on("session_start", clearCapture);
+	pi.on("session_compact", clearCapture);
 	pi.on("session_tree", clearCapture);
 	pi.on("session_shutdown", clearCapture);
 
-	pi.on("agent_end", (event, ctx) => {
-		const lastAssistant = event.messages.findLast((message) => message.role === "assistant");
-		// Some adapters report Esc as stopReason="error"; the agent signal is
-		// authoritative. Only discard a valid snapshot whose payload hook never ran.
-		if (!ctx.signal?.aborted && !(lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted")) return;
-		const sessionId = ctx.sessionManager.getSessionId();
-		const captured = capturedBySession.get(sessionId);
-		if (captured && canDiscardAbortedCapture(captured)) {
-			capturedBySession.delete(sessionId);
+	const attempt = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext, reconstruct: boolean) => {
+		event.signal.throwIfAborted();
+		const model = ctx.model;
+		if (!model || isExcludedProvider(model)) throw new Error("no supported text-compaction model selected");
+		log({ ev: "compact-start", model: modelKey(model), reason: event.reason, willRetry: event.willRetry });
+		if (model.api !== "openai-completions" && model.api !== "openai-responses" && model.api !== "anthropic-messages") {
+			throw new Error(`unsupported cache API: ${model.api}`);
 		}
-	});
 
-	const attempt = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult> => {
-		try {
-			event.signal?.throwIfAborted();
-			const model = ctx.model;
-			if (!model) return cancelCompaction(ctx, "no selected model");
-			if (isExcludedProvider(model)) return cancelCompaction(ctx, "Codex requires its checkpoint adapter");
-			log({ ev: "compact-start", model: modelKey(model), reason: event.reason, willRetry: event.willRetry });
-			if (model.api !== "openai-completions" && model.api !== "openai-responses" && model.api !== "anthropic-messages") {
-				return cancelCompaction(ctx, `unsupported API: ${model.api}`);
-			}
+		const prep = event.preparation;
+		const preCutMessages = [
+			...prep.messagesToSummarize,
+			...(prep.isSplitTurn ? prep.turnPrefixMessages : []),
+		].filter((message) => !isOmittedAssistant(message));
+		if (convertToLlm(preCutMessages).length < 1) throw new Error("no conversation to summarize");
 
-			const prep = event.preparation;
-			const preCutMessages = [
-				...prep.messagesToSummarize,
-				...(prep.isSplitTurn ? prep.turnPrefixMessages : []),
-			].filter((message) => !isOmittedAssistant(message));
-			if (convertToLlm(preCutMessages).length < 1) {
-				return cancelCompaction(ctx, "no conversation to summarize");
-			}
-
-			const sessionId = ctx.sessionManager.getSessionId();
-			const captured = capturedBySession.get(sessionId);
-			if (!captured || captured.modelKey !== modelKey(model)) {
-				log({ ev: "reconstruct", model: modelKey(model) });
-				const summary = await summarizeReconstructed(pi, event, ctx, preCutMessages);
-				return { compaction: createTextCompaction(prep, model, summary) };
-			}
-			if (!isReadyCapture(captured)) return cancelCompaction(ctx, "incomplete live request capture");
-
-			const payload = captured.payload.body;
-			const messages = model.api === "openai-responses" ? payload.input : payload.messages;
-			if (!Array.isArray(messages)) {
-				return cancelCompaction(ctx, "captured request has no conversation field");
-			}
-			// Never replay images disabled since capture, or rewrite a cached prefix.
-			if (pi.getSettings().images?.blockImages && messages.some((item) =>
-				[item?.content, item?.output].some((blocks) => Array.isArray(blocks) && blocks.some((block) =>
-					["input_image", "image", "image_url"].includes(block?.type))))) {
-				return cancelCompaction(ctx, "captured request contains currently blocked images");
-			}
-
-			// Match pi's known error/abort omissions in temporary views only.
-			// Saved history, the captured payload, and the retained boundary stay intact.
-			// Newer pi versions include prompt-state messages in the transcript.
-			// Native preparation omits them; their wire representation stays intact.
-			const capturedCtx = captured.contextMessages.filter((message) =>
-				!isOmittedAssistant(message) && message.role !== "system",
-			);
-			if (capturedCtx[0]?.role === "compactionSummary") {
-				if (capturedCtx[0].summary !== prep.previousSummary) {
-					return cancelCompaction(ctx, "captured previous summary differs from preparation");
-				}
-				preCutMessages.unshift(capturedCtx[0]);
-			} else if (prep.previousSummary !== undefined) {
-				return cancelCompaction(ctx, "captured previous summary is missing");
-			}
-			if (capturedCtx.length < preCutMessages.length) {
-				return cancelCompaction(ctx, "captured history is shorter than the selected prefix");
-			}
-			for (let i = 0; i < preCutMessages.length; i++) {
-				if (!deepEqual(capturedCtx[i], preCutMessages[i])) {
-					return cancelCompaction(ctx, `captured history differs at message ${i}`);
-				}
-			}
-
-			if (model.api === "openai-responses") {
-				const maxTokens = summaryOutputTokens(model, prep.settings);
-				const summary = await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), maxTokens, event.signal);
-				return { compaction: createTextCompaction(prep, model, summary) };
-			}
-
-			const summary = await summarizeCapturedChat(event, ctx, captured, capturedCtx, preCutMessages);
+		if (reconstruct) {
+			log({ ev: "reconstruct", model: modelKey(model) });
+			const summary = await summarizeReconstructed(pi, event, ctx, preCutMessages);
 			return { compaction: createTextCompaction(prep, model, summary) };
-		} catch (err) {
-			if (err instanceof CompactionLimitError) throw err;
-			return cancelCompaction(ctx, err instanceof Error ? err.message : String(err));
 		}
+		const captured = capturedBySession.get(ctx.sessionManager.getSessionId());
+		if (!captured || captured.modelKey !== modelKey(model)) throw new CacheAlignmentError("no matching live capture");
+		if (!isReadyCapture(captured)) throw new CacheAlignmentError("incomplete live request capture");
+
+		const payload = captured.payload.body;
+		const messages = model.api === "openai-responses" ? payload.input : payload.messages;
+		if (!Array.isArray(messages)) throw new CacheAlignmentError("captured request has no conversation field");
+		// Reconstruction applies current image policy instead of replaying blocked images.
+		if (pi.getSettings().images?.blockImages && messages.some((item) =>
+			[item?.content, item?.output].some((blocks) => Array.isArray(blocks) && blocks.some((block) =>
+				["input_image", "image", "image_url"].includes(block?.type))))) {
+			throw new CacheAlignmentError("captured request contains currently blocked images");
+		}
+
+		// Only reuse a captured prefix that matches Pi's projected preparation.
+		const capturedCtx = captured.contextMessages.filter((message) =>
+			!isOmittedAssistant(message) && message.role !== "system",
+		);
+		if (capturedCtx[0]?.role === "compactionSummary") {
+			if (capturedCtx[0].summary !== prep.previousSummary) throw new CacheAlignmentError("captured previous summary differs from preparation");
+			preCutMessages.unshift(capturedCtx[0]);
+		} else if (prep.previousSummary !== undefined) {
+			throw new CacheAlignmentError("captured previous summary is missing");
+		}
+		if (capturedCtx.length < preCutMessages.length) throw new CacheAlignmentError("captured history is shorter than the selected prefix");
+		for (let i = 0; i < preCutMessages.length; i++) {
+			if (!deepEqual(capturedCtx[i], preCutMessages[i])) throw new CacheAlignmentError(`captured history differs at message ${i}`);
+		}
+
+		const summary = model.api === "openai-responses"
+			? await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), summaryOutputTokens(model), event.signal)
+			: await summarizeCapturedChat(event, ctx, captured, capturedCtx, preCutMessages);
+		return { compaction: createTextCompaction(prep, model, summary) };
 	};
 
 	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult> => {
-		if (!ctx.model || isExcludedProvider(ctx.model)) return cancelCompaction(ctx, "no supported text-compaction model selected");
 		let current = event;
 		let usage: Usage | undefined;
-		// Each HTTP request has its own timeout; this bounds the whole recovery.
+		// Local to this compaction: the next operation always tries capture again.
+		let reconstruct = false;
 		const signal = AbortSignal.any([event.signal, AbortSignal.timeout(COMPACTION_TIMEOUT_MS)]);
-		for (let retry = 0; ; retry++) {
+		for (;;) {
 			try {
-				const result = await attempt({ ...current, signal }, ctx);
-				if (result?.compaction) {
-					result.compaction.usage = addUsage(usage, result.compaction.usage);
-					log({ ev: "compact-ok", summaryChars: result.compaction.summary.length, usage: result.compaction.usage });
-				}
-				return result ?? cancelCompaction(ctx, "no summary checkpoint produced");
+				const result = await attempt({ ...current, signal }, ctx, reconstruct);
+				result.compaction.usage = addUsage(usage, result.compaction.usage);
+				log({ ev: "compact-ok", summaryChars: result.compaction.summary.length, usage: result.compaction.usage });
+				return result;
 			} catch (err) {
+				signal.throwIfAborted();
+				if (err instanceof CacheAlignmentError && !reconstruct) {
+					reconstruct = true;
+					warnCompaction(ctx, "Rebuilding the compaction request from saved state. Cache reuse is uncertain; this may cost more.");
+					log({ ev: "cache-miss", reason: err.message });
+					continue;
+				}
 				if (!(err instanceof CompactionLimitError)) throw err;
 				usage = addUsage(usage, err.usage);
 				let next: ReturnType<typeof prepareRetry> = undefined;
-				if (!signal.aborted && retry < MAX_LIMIT_RETRIES) {
-					const settings = current.preparation.settings;
-					const keepRecentTokens = settings.keepRecentTokens > 0 ? settings.keepRecentTokens * 2 : 8192;
-					if (Number.isSafeInteger(keepRecentTokens)) {
-						try {
-							next = prepareRetry(current, keepRecentTokens);
-						} catch {
-							// Invalid preparation must still cancel compaction.
-						}
-					}
-				}
+				let keepRecentTokens = current.preparation.settings.keepRecentTokens;
+				// Skip repeated cuts: only send another request when the prefix shrinks.
+				do {
+					keepRecentTokens = keepRecentTokens > 0 ? keepRecentTokens * 2 : 8192;
+					if (!Number.isSafeInteger(keepRecentTokens)) break;
+					next = prepareRetry(current, keepRecentTokens);
+				} while (next && next.firstKeptEntryId === current.preparation.firstKeptEntryId);
 				const previousIndex = event.branchEntries.findIndex((entry) => entry.id === current.preparation.firstKeptEntryId);
 				const nextIndex = next ? event.branchEntries.findIndex((entry) => entry.id === next.firstKeptEntryId) : -1;
 				if (!next || nextIndex < 0 || nextIndex >= previousIndex) {
-					log({ ev: "limit-exhausted", retry, error: err.message, usage });
-					return cancelCompaction(ctx, `limit recovery exhausted: ${err.message}`);
+					log({ ev: "limit-exhausted", error: err.message, usage });
+					throw new Error(`cached backoff exhausted: ${err.message}`);
 				}
-				log({ ev: "limit-retry", retry: retry + 1, error: err.message, keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
+				log({ ev: "limit-retry", keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
 				try {
-					if (ctx.hasUI) ctx.ui.notify(`Retrying cache-aligned compaction with ${next.settings.keepRecentTokens} recent tokens retained.`, "info");
+					if (ctx.hasUI) ctx.ui.notify(`Retrying cached compaction with ${next.settings.keepRecentTokens} recent tokens retained.`, "info");
 				} catch {
-					// Keep recovering even if the UI is unavailable.
+					// Progress display must not affect compaction.
 				}
 				current = { ...event, preparation: next };
 			}
