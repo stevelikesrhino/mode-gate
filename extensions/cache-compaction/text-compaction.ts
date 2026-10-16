@@ -570,12 +570,9 @@ async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeComp
 	if (previous.length !== (event.preparation.previousSummary === undefined ? 0 : 1) ||
 		(previous[0]?.role === "compactionSummary" && previous[0].summary !== event.preparation.previousSummary)) throw new Error("reconstructed previous summary does not match");
 	if (!prefix.some((message) => message.role === "system")) throw new Error("no saved system prompt for cache reconstruction");
-	// A switch before before_agent_start has not applied model-system-prompt yet.
-	const lastModel = projection.model;
-	if (lastModel && (lastModel.provider !== ctx.model!.provider || lastModel.modelId !== ctx.model!.id)) throw new Error("selected model has no applied saved prompt for cache reconstruction");
-	const lastSwitch = event.branchEntries.findLastIndex((entry) => entry.type === "model_change");
-	if (lastSwitch >= 0 && !event.branchEntries.slice(lastSwitch + 1).some((entry) => entry.type === "message" && entry.message.role === "assistant" &&
-		entry.message.provider === ctx.model!.provider && entry.message.model === ctx.model!.id)) throw new Error("selected model has no applied saved prompt for cache reconstruction");
+	// A model switch need not have a live response yet. Summarize the saved
+	// prompt/tool state with the selected model; do not guess unapplied prompt
+	// mappings or substitute the idle prompt. Cache reuse is already best effort.
 	const blockImages = pi.getSettings().images?.blockImages;
 	const filtered = blockImages ? prefix.map((message) => {
 		if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) return message;

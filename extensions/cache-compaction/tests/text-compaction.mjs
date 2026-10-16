@@ -45,7 +45,7 @@ function fixture(t, api = "openai-completions") {
 			// its instruction. Provider serialization is deliberately not reimplemented.
 			streamSimple: (current, context, options) => ({ result: async () => {
 				const body = options.onPayload({ messages: context.messages });
-				state.sdk.push({ context, options, body });
+				state.sdk.push({ model: current, context, options, body });
 				return { ...assistant, content: [{ type: "text", text: "Summary" }], rawStopReason: current.api === "anthropic-messages" ? "end_turn" : "stop" };
 			} }),
 		} };
@@ -254,13 +254,19 @@ test("limit backoff uses edited history, sums usage, and stops when no earlier c
 	assert.equal(f.sdk.length, 0, "no standalone summarizer");
 });
 
-test("missing capture reconstructs; an unapplied model switch yields to the dispatcher", async t => {
+test("missing capture and a newly selected model reconstruct without a live turn", async t => {
 	const f = fixture(t);
 	assert.ok((await f.run()).compaction);
 	await f.capture();
-	f.ctx.model = { ...f.ctx.model, id: "other-model" };
-	await assert.rejects(() => f.run(), /no applied saved prompt/);
-	assert.equal(f.sdk.length, 1);
+	f.ctx.model = { ...f.ctx.model, provider: "BigModel", id: "glm-5.3" };
+	f.ctx.getSystemPrompt = () => { throw new Error("Do not substitute an unapplied idle prompt"); };
+	const original = structuredClone(f.branch);
+	const result = await f.run();
+	assert.equal(result.compaction.firstKeptEntryId, f.event.preparation.firstKeptEntryId);
+	assert.equal(f.sdk.length, 2);
+	assert.equal(f.sdk[1].model, f.ctx.model, "the selected model generates the summary");
+	assert.deepEqual(f.sdk[1].context.messages, f.sdk[0].context.messages, "reuse saved prompt/tool state and conversation");
+	assert.deepEqual(f.branch, original, "reconstruction does not rewrite saved history");
 	assert.equal(f.http.length, 0, "never replay another model's captured request");
 });
 
@@ -310,8 +316,9 @@ test("reconstruction uses edited history and saved prompt/tools, including later
 	assert.match(body.messages.at(-1).content, /Do not call any tools/);
 	assert.deepEqual(f.branch, original);
 	f.branch.push({ type: "model_change", id: "switch", parentId: "edit", timestamp: new Date(6).toISOString(), provider: f.ctx.model.provider, modelId: f.ctx.model.id });
-	await assert.rejects(() => f.run(), /no applied saved prompt/, "unapplied model switch yields to native rather than guessing prompt state");
-	assert.equal(f.sdk.length, 1);
+	assert.ok((await f.run()).compaction, "a model-change entry needs no subsequent assistant response");
+	assert.equal(f.sdk.length, 2);
+	assert.deepEqual(f.sdk[1].context, context, "the model-change marker does not alter saved prompt or edited history");
 });
 
 test("Responses verifies captured prefixes, rejects refusals, and reconstructs divergent wire", async t => {
