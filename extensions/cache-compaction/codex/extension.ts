@@ -10,6 +10,7 @@ import {
 	buildReplacementHistory,
 	buildToolPayload,
 	callRemoteCompaction,
+	compactionInputForBranch,
 	effectiveInputForBranch,
 	findNativeCheckpoint,
 	isJsonObject,
@@ -186,10 +187,11 @@ export function registerCodexCompaction(pi: ExtensionAPI) {
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			const branch = event.branchEntries as SessionEntry[];
-			const input = effectiveInputForBranch({
+			const { input, firstKeptEntryId } = compactionInputForBranch({
 				branch,
 				model,
 				tools: pi.getAllTools(),
+				firstKeptEntryId: event.preparation.firstKeptEntryId,
 			});
 			const cached = payloadShapeBySession.get(sessionId);
 			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
@@ -203,7 +205,7 @@ export function registerCodexCompaction(pi: ExtensionAPI) {
 			return {
 				compaction: {
 					summary: localMarker(),
-					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
 					usage: native.usage,
 					details: native.details,

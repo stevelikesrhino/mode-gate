@@ -10,7 +10,7 @@ import {
 import { calculateCost, type Message, type Model, type Usage } from "@earendil-works/pi-ai";
 
 export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
-export const NATIVE_COMPACTION_VERSION = 1;
+export const NATIVE_COMPACTION_VERSION = 2;
 export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 export const RETAINED_USER_TOKEN_BUDGET = 64_000;
 
@@ -22,7 +22,8 @@ export type ResponseItem = JsonObject & { type?: string };
 
 export interface NativeCompactionDetails {
 	kind: typeof NATIVE_COMPACTION_KIND;
-	version: typeof NATIVE_COMPACTION_VERSION;
+	/** v1 absorbed all pre-checkpoint history; v2 leaves Pi's retained tail outside it. */
+	version: 1 | typeof NATIVE_COMPACTION_VERSION;
 	modelKey: string;
 	replacementHistory: ResponseItem[];
 }
@@ -69,7 +70,7 @@ function isResponseItem(value: unknown): value is ResponseItem {
 
 export function parseNativeCompactionDetails(value: unknown): NativeCompactionDetails | undefined {
 	if (!isJsonObject(value)) return undefined;
-	if (value.kind !== NATIVE_COMPACTION_KIND || value.version !== NATIVE_COMPACTION_VERSION) return undefined;
+	if (value.kind !== NATIVE_COMPACTION_KIND || (value.version !== 1 && value.version !== NATIVE_COMPACTION_VERSION)) return undefined;
 	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
 
 	const replacementHistory = value.replacementHistory.filter(isResponseItem);
@@ -85,7 +86,7 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 
 	return {
 		kind: NATIVE_COMPACTION_KIND,
-		version: NATIVE_COMPACTION_VERSION,
+		version: value.version,
 		modelKey: value.modelKey,
 		replacementHistory: replacementHistory.map(cloneItem),
 	};
@@ -287,39 +288,83 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 	return items;
 }
 
-export function effectiveInputForBranch(params: {
+type BranchInputParams = {
 	branch: SessionEntry[];
 	model: Model<any>;
 	tools: ToolInfo[];
-}): ResponseItem[] {
+};
+
+/** Project before cutting so later context edits also apply to the compacted prefix. */
+function replayHistoryForBranch(params: BranchInputParams): {
+	replacementHistory: ResponseItem[];
+	entries: ReturnType<typeof buildSessionProjection>["entries"];
+	checkpoint?: NativeCheckpoint;
+} {
 	const { branch } = params;
-	const checkpoint = findNativeCheckpoint(branch);
-	if (checkpoint.status === "invalid") {
+	const lookup = findNativeCheckpoint(branch);
+	if (lookup.status === "invalid") {
 		throw new Error("The latest OpenAI Codex native compaction checkpoint is malformed.");
 	}
-	if (checkpoint.status === "valid") {
-		if (checkpoint.checkpoint.details.modelKey !== modelKey(params.model)) {
-			throw new Error("The latest OpenAI Codex native compaction checkpoint belongs to a different model.");
-		}
-		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
-		const tailIds = new Set(tail.map((entry) => entry.id));
-		const opaqueEdit = tail.find(
-			(entry) => entry.type === "context_edit" && !tailIds.has(entry.targetId),
-		);
-		if (opaqueEdit?.type === "context_edit") {
-			throw new Error(
-				"A context edit targets history inside the latest OpenAI Codex native compaction checkpoint.",
-			);
-		}
-		const tailMessages = buildSessionProjection(tail).messages;
-		return [
-			...checkpoint.checkpoint.details.replacementHistory.map(cloneItem),
-			...messagesToResponseItems(params.model, convertToLlm(tailMessages), params.tools),
-		];
+	if (lookup.status === "none") {
+		return { replacementHistory: [], entries: buildSessionProjection(branch).entries };
 	}
+	const checkpoint = lookup.checkpoint;
+	if (checkpoint.details.modelKey !== modelKey(params.model)) {
+		throw new Error("The latest OpenAI Codex native compaction checkpoint belongs to a different model.");
+	}
+	let tailStart = checkpoint.entryIndex + 1;
+	if (checkpoint.details.version === 2) {
+		const entry = branch[checkpoint.entryIndex];
+		if (entry.type !== "compaction") throw new Error("A prefix checkpoint requires a Pi compaction entry.");
+		const keptIndex = branch.findIndex((candidate) => candidate.id === entry.firstKeptEntryId);
+		if (keptIndex < 0 || keptIndex > checkpoint.entryIndex) {
+			throw new Error("The OpenAI Codex checkpoint retained boundary is missing or invalid.");
+		}
+		tailStart = keptIndex === checkpoint.entryIndex ? checkpoint.entryIndex + 1 : keptIndex;
+	}
+	const tailIds = new Set(branch.slice(tailStart)
+		.filter((entry) => entry.id !== checkpoint.entryId)
+		.map((entry) => entry.id));
+	const opaqueEdit = branch.slice(checkpoint.entryIndex + 1).find(
+		(entry) => entry.type === "context_edit" && !tailIds.has(entry.targetId),
+	);
+	if (opaqueEdit) {
+		throw new Error("A context edit targets history inside the latest OpenAI Codex native compaction checkpoint.");
+	}
+	// Legacy checkpoints already absorbed their nominal kept range. Only v2 may
+	// use Pi's full projection to replay that range, including cross-checkpoint edits.
+	const projection = buildSessionProjection(checkpoint.details.version === 1 ? branch.slice(tailStart) : branch);
+	return {
+		checkpoint,
+		replacementHistory: checkpoint.details.replacementHistory.map(cloneItem),
+		entries: projection.entries.filter((entry) => entry.sourceEntry.id !== checkpoint.entryId),
+	};
+}
 
-	const context = buildSessionProjection(branch);
-	return messagesToResponseItems(params.model, convertToLlm(context.messages), params.tools);
+export function effectiveInputForBranch(params: BranchInputParams): ResponseItem[] {
+	const { replacementHistory, entries } = replayHistoryForBranch(params);
+	const messages = convertToLlm(entries.flatMap((entry) => entry.messages));
+	return [...replacementHistory, ...messagesToResponseItems(params.model, messages, params.tools)];
+}
+
+export function compactionInputForBranch(params: BranchInputParams & { firstKeptEntryId: string }): {
+	input: ResponseItem[];
+	firstKeptEntryId: string;
+} {
+	const { replacementHistory, entries, checkpoint } = replayHistoryForBranch(params);
+	let boundary = entries.findIndex((entry) => entry.sourceEntry.id === params.firstKeptEntryId);
+	if (boundary < 0 && checkpoint?.details.version === 1) {
+		const rawBoundary = params.branch.findIndex((entry) => entry.id === params.firstKeptEntryId);
+		// Do not resurrect a legacy checkpoint's absorbed "kept" messages when
+		// migrating it. Retain its entire still-verbatim suffix instead.
+		if (rawBoundary >= 0 && rawBoundary <= checkpoint.entryIndex) boundary = 0;
+	}
+	const firstKeptEntryId = entries[boundary]?.sourceEntry.id;
+	if (!firstKeptEntryId) throw new Error("The OpenAI Codex compaction retained boundary is missing or opaque.");
+	const messages = convertToLlm(entries.slice(0, boundary).flatMap((entry) => entry.messages));
+	const input = [...replacementHistory, ...messagesToResponseItems(params.model, messages, params.tools)];
+	if (!input.length) throw new Error("There is no OpenAI Codex history before the retained boundary.");
+	return { firstKeptEntryId, input };
 }
 
 function responseItemText(item: ResponseItem): string {

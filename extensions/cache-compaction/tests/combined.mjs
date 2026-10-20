@@ -95,6 +95,8 @@ assert.equal(calls[0].url, "https://proxy.example/codex/responses", "auth baseUr
 assert.deepEqual(calls[0].body.input.at(-1), { type: "compaction_trigger" });
 assert.equal(calls[0].body.reasoning.effort, "low");
 assert.equal(result.compaction.details.kind, "openai-codex-native-compaction");
+assert.equal(result.compaction.details.version, 2);
+assert.ok(!JSON.stringify(calls[0].body.input).includes("Continue."), "retained tail is excluded from compaction");
 assert.equal(result.compaction.firstKeptEntryId, prep.firstKeptEntryId);
 assert.equal(result.compaction.usage.cacheRead, 80);
 assert.equal(result.compaction.usage.input, 20);
@@ -102,7 +104,8 @@ assert.deepEqual(result.compaction.details.replacementHistory.at(-1), opaque);
 assert.equal(calls[0].init.headers.get("chatgpt-account-id"), "test-account");
 
 // Replay old-package checkpoint entries, including local-marker suppression.
-const checkpoint = { ...result.compaction, type: "compaction", id: "cp", parentId: "tail", timestamp: "2026-09-07T00:01:00Z" };
+const checkpoint = { ...result.compaction, type: "compaction", id: "cp", parentId: "tail", timestamp: "2026-09-07T00:01:00Z",
+	details: { ...result.compaction.details, version: 1 } };
 const checkpointBranch = [...branch, checkpoint];
 branch = [...checkpointBranch, entry("after", "cp", { ...userNext, content: "What token did I ask you to remember?" })];
 const marker = { role: "compactionSummary", summary: checkpoint.summary, tokensBefore: 50000, timestamp: 4 };
