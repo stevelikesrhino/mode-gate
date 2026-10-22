@@ -1,0 +1,11 @@
+{
+  "name": "pi-shorter-bash",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node --test tests/compatibility.test.mjs"
+  }
+}
