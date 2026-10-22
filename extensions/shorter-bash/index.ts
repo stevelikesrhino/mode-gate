@@ -110,7 +110,7 @@ export default function shorterBash(pi: ExtensionAPI): void {
 		const parameters = Type.Object({
 			...base.parameters.properties,
 			description: Type.String({
-				description: "Short, plain-language description of what this command does. Use one brief line, not the shell command.",
+				description: "Write one short, plain-language description of what this command does.",
 				minLength: 1,
 			}),
 		});
