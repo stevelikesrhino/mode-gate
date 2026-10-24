@@ -71,7 +71,7 @@ export function parseUsage(payload: unknown, now = Date.now()): UsageSnapshot {
 }
 
 export async function fetchUsage(ctx: ExtensionContext, signal: AbortSignal): Promise<UsageSnapshot> {
-	// The new openai token-sharing login cannot read wham/usage. Do not send its
+	// OpenAI token-sharing credentials cannot read wham/usage. Do not send those
 	// credentials to that endpoint or silently assume a different account's limits.
 	const models = ctx.modelRegistry.getAll();
 	const model = models.find(model => model.provider === "openai-codex");

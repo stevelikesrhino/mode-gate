@@ -1,6 +1,6 @@
 // Isolated Pi session E2E for ordinary, cache-aligned Responses text summaries.
-// Offline: PI_COMPACTION_STUB=1 node extensions/cache-compaction/tests/responses-cache-e2e.mjs
-// Live: PI_LIVE_COMPACTION=1 node extensions/cache-compaction/tests/responses-cache-e2e.mjs
+// Offline: PI_COMPACTION_STUB=1 node extensions/ccc-evo/tests/responses-cache-e2e.mjs
+// Live: PI_LIVE_COMPACTION=1 node extensions/ccc-evo/tests/responses-cache-e2e.mjs
 // Optional offline tool-history variant: PI_E2E_TOOLS=1.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";

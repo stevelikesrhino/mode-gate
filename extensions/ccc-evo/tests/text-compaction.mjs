@@ -50,7 +50,7 @@ function fixture(t, api = "openai-completions") {
 			} }),
 		} };
 	const compact = register({ on: (name, fn) => (handlers[name] ??= []).push(fn),
-		getSettings: () => state.settings, getThinkingLevel: () => "off" });
+		getSettings: () => state.settings, getThinkingLevel: () => "off" }, payload => payload);
 	const emit = async (name, event) => { for (const fn of handlers[name] ?? []) await fn(event, ctx); };
 	const event = { preparation: { firstKeptEntryId: "e3", messagesToSummarize: [user, assistant], turnPrefixMessages: [],
 		isSplitTurn: false, tokensBefore: 50000, settings: { enabled: true, reserveTokens: 1024, keepRecentTokens: 8192 } },
@@ -291,7 +291,7 @@ test("capture belongs to its registration, even when runtimes share a session ID
 	const f = fixture(t);
 	await f.capture();
 	const handlers = {};
-	const other = register({ on: (name, fn) => (handlers[name] ??= []).push(fn), getSettings: () => ({}), getThinkingLevel: () => "off" });
+	const other = register({ on: (name, fn) => (handlers[name] ??= []).push(fn), getSettings: () => ({}), getThinkingLevel: () => "off" }, payload => payload);
 	assert.ok((await other(f.event, f.ctx)).compaction);
 	assert.equal(f.sdk.length, 1, "another runtime must reconstruct rather than borrow capture");
 	for (const fn of handlers.session_start) await fn({}, f.ctx);

@@ -1,5 +1,5 @@
 // Opt-in live provider tests. Only synthetic context and a read-only fixture tool are sent.
-// PI_LIVE_COMPACTION=1 node extensions/cache-compaction/tests/live.mjs <provider> <model>
+// PI_LIVE_COMPACTION=1 node extensions/ccc-evo/tests/live.mjs <provider> <model>
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

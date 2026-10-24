@@ -3,12 +3,14 @@ import { registerCodexCompaction } from "./codex/extension.ts";
 import { findNativeCheckpoint, isOpenAICodexModel } from "./codex/native-compaction.ts";
 import registerTextCompaction, { warnCompaction } from "./text-compaction.ts";
 import registerCompactionStats from "./stats.ts";
+import registerFastMode from "./fast.ts";
+import { createFastMode } from "./request-policy.ts";
 
-/** One owner for compaction; branch summarization remains pi's responsibility. */
-export default function cacheCompaction(pi: ExtensionAPI): void {
-	// Keep old Codex checkpoints readable; new public Responses uses text mode.
-	const compactCodex = registerCodexCompaction(pi);
-	const compactText = registerTextCompaction(pi);
+/** Dispatch Codex and text compaction; leave branch summaries to Pi. */
+export default function cccEvo(pi: ExtensionAPI): void {
+	const fastMode = createFastMode();
+	const compactCodex = registerCodexCompaction(pi, fastMode.prepareRequest);
+	const compactText = registerTextCompaction(pi, fastMode.prepareRequest);
 	registerCompactionStats(pi);
 	const opaqueError = "This branch contains an opaque Codex checkpoint. Use its original Codex model or return to the branch before compaction; it cannot be converted to a text summary.";
 	const notifyOpaque = (ctx: ExtensionContext): void => {
@@ -19,8 +21,7 @@ export default function cacheCompaction(pi: ExtensionAPI): void {
 		}
 	};
 
-	// An opaque checkpoint is not a plaintext summary. Do not silently lose it
-	// after switching an existing Codex session to public Responses.
+	// Public Responses cannot replay an opaque Codex checkpoint.
 	pi.on("before_provider_request", (event, ctx) => {
 		if (ctx.model?.api !== "openai-responses" || findNativeCheckpoint(ctx.sessionManager.getBranch()).status === "none") return;
 		ctx.abort();
@@ -53,4 +54,7 @@ export default function cacheCompaction(pi: ExtensionAPI): void {
 			return nativeFallback ? undefined : { cancel: true };
 		}
 	});
+
+	// Apply Fast after payload hooks so captures do not retain our priority override.
+	registerFastMode(pi, fastMode);
 }

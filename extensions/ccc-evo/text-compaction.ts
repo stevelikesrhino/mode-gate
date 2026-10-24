@@ -1,28 +1,14 @@
 /**
- * Cache-aligned compaction for non-Codex models.
+ * Text compaction for Chat Completions, Responses, and Anthropic Messages.
  *
- * pi's native compaction serializes the conversation into a fresh prompt under
- * a different system prompt, preventing direct reuse of the live conversation's
- * cached prefix. This extension instead reuses the provider payload captured
- * by its before_provider_request handler (which must run after other transforms),
- * truncates its message list at the compaction cut point, and appends a
- * summarization instruction. Retained message content stays unchanged;
- * Anthropic cache metadata may move to the retained boundary. Cache reads
- * still depend on provider-side serialization and cache availability.
+ * Reuse a verified provider-payload prefix and append a summary instruction.
+ * Capture must follow payload transforms; Anthropic cache markers may move to
+ * the cut. Missing or unverifiable captures reconstruct edited history and saved
+ * prompt/tool state without replaying request hooks. Limit retries shorten the
+ * prefix by retaining more recent history.
  *
- * Scope:
- * - Legacy openai-codex compaction remains owned by its checkpoint reader.
- * - Branch summarization stays native; tree navigation only invalidates capture.
- * - openai-completions, openai-responses, and anthropic-messages are supported;
- *   other APIs use Pi's native summary.
- *
- * Missing capture is reconstructed from projected conversation and prompt state.
- * Request-only extension transforms are not replayed during reconstruction.
- * Limit failures double retained history and retry a shorter cached prefix.
- * Unverifiable captures use saved-state reconstruction with a cost warning.
- * Failed or exhausted attempts yield to Pi's native summary for this operation.
- * Saved history and persistent settings are unchanged until a summary succeeds.
- * Failed attempts can still add latency and cost.
+ * index.ts handles Codex dispatch and native-summary fallback. No partial
+ * summary is saved; failed requests may still consume provider quota.
  */
 
 import { buildSessionProjection, convertToLlm, findCutPoint, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBeforeCompactResult, type SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -30,6 +16,7 @@ import { isContextOverflow, type Usage } from "@earendil-works/pi-ai";
 import fs from "node:fs";
 import { findNativeCheckpoint } from "./codex/native-compaction.ts";
 import { createTextCompaction, summaryOutputTokens, type Summary } from "./text-result.ts";
+import type { RequestPolicy } from "./request-policy.ts";
 
 type Conversation = Parameters<typeof convertToLlm>[0];
 type CompactionModel = NonNullable<ExtensionContext["model"]>;
@@ -46,8 +33,7 @@ function log(entry: Record<string, unknown>): void {
 	}
 }
 
-// pi's native summarization prompts, verbatim, so summaries keep the same
-// structured format. The tool prohibition is appended on top.
+// Keep Pi's structured summary format and append an explicit tool prohibition.
 const BASE_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -330,7 +316,8 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
-async function postJson(url: string, body: JsonObject, headers: Record<string, string>, signal: AbortSignal, model: NonNullable<ExtensionContext["model"]>): Promise<JsonObject> {
+async function postJson(url: string, body: JsonObject, headers: Record<string, string>, signal: AbortSignal,
+	model: CompactionModel, prepareRequest: RequestPolicy): Promise<JsonObject> {
 	let lastError: unknown;
 	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
 		if (attempt > 0) await delay(RETRY_DELAY_MS, signal);
@@ -340,7 +327,7 @@ async function postJson(url: string, body: JsonObject, headers: Record<string, s
 			res = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: JSON.stringify(prepareRequest(body, model)),
 				signal: requestSignal(signal),
 			});
 			if (res.ok) {
@@ -507,7 +494,8 @@ function validateToolBoundary(messages: ReturnType<typeof convertToLlm>): void {
 }
 
 async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof convertToLlm>, maxTokens: number, signal: AbortSignal,
-	onPayload: (generated: unknown) => JsonObject, headers?: Record<string, string>, pi?: ExtensionAPI): Promise<{ text: string; usage: Usage }> {
+	onPayload: (generated: unknown) => JsonObject,
+	headers?: Record<string, string>, pi?: ExtensionAPI): Promise<{ text: string; usage: Usage }> {
 	const model = ctx.model!;
 	validateToolBoundary(messages);
 	let invalidOutput = false;
@@ -525,6 +513,7 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 		onPayload: (generated) => {
 			signal.throwIfAborted();
 			try {
+				// ModelRuntime applies the live Fast policy after this callback.
 				return onPayload(generated);
 			} catch (error) {
 				// SDK streams normalize hook exceptions into error responses.
@@ -554,7 +543,8 @@ async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof c
 	return { text, usage: result.usage };
 }
 
-async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeCompactEvent, ctx: ExtensionContext, expected: Conversation): Promise<Summary> {
+async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeCompactEvent, ctx: ExtensionContext,
+	expected: Conversation): Promise<Summary> {
 	if (findNativeCheckpoint(event.branchEntries).status !== "none") throw new Error("opaque Codex history cannot be reconstructed as text");
 	const projection = buildSessionProjection(event.branchEntries);
 	const boundary = projection.entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
@@ -593,7 +583,8 @@ async function summarizeReconstructed(pi: ExtensionAPI, event: SessionBeforeComp
 	}, undefined, pi);
 }
 
-async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture, count: number, instruction: string, maxTokens: number, signal: AbortSignal): Promise<Summary> {
+async function summarizeResponses(ctx: ExtensionContext, captured: ReadyCapture, count: number, instruction: string,
+	maxTokens: number, signal: AbortSignal): Promise<Summary> {
 	const model = ctx.model!;
 	const payload = captured.payload.body;
 	const input = payload.input;
@@ -712,7 +703,7 @@ function parseChatSummary(model: CompactionModel, data: JsonObject): Summary {
 // Manual replay is limited to captured Chat/Anthropic requests. Keep its
 // provider-specific transport and normalization out of capture/retry ownership.
 async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: ExtensionContext,
-	captured: ReadyCapture, context: Conversation, prefix: Conversation): Promise<Summary> {
+	captured: ReadyCapture, context: Conversation, prefix: Conversation, prepareRequest: RequestPolicy): Promise<Summary> {
 	const model = ctx.model!;
 	const prep = event.preparation;
 	const payload = captured.payload.body;
@@ -790,17 +781,15 @@ async function summarizeCapturedChat(event: SessionBeforeCompactEvent, ctx: Exte
 	}
 
 	log({ ev: "request", url, preCutCount, cutIndex, payloadMsgCount: messages.length, bodyMsgCount: body.messages.length, maxTokens, keepRecentTokens: prep.settings.keepRecentTokens });
-	const data = await postJson(url, body, headers, event.signal, model);
+	const data = await postJson(url, body, headers, event.signal, model, prepareRequest);
 	log({ ev: "raw-usage", usage: data.usage });
 	return parseChatSummary(model, data);
 }
 
-export default function registerTextCompaction(pi: ExtensionAPI) {
+export default function registerTextCompaction(pi: ExtensionAPI, prepareRequest: RequestPolicy) {
 	const capturedBySession = new Map<string, CapturedRequest>();
 
-	// Fires once per provider request, before convertToLlm and before the
-	// payload is built: the agent context messages this request will be based
-	// on. Captured so compaction can verify prefix identity.
+	// Pair the agent context with its serialized payload to verify prefix identity.
 	pi.on("context", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		capturedBySession.delete(sessionId);
@@ -923,7 +912,7 @@ export default function registerTextCompaction(pi: ExtensionAPI) {
 
 		const summary = model.api === "openai-responses"
 			? await summarizeResponses(ctx, captured, preCutMessages.length, buildInstruction(prep.previousSummary, event.customInstructions), summaryOutputTokens(model), event.signal)
-			: await summarizeCapturedChat(event, ctx, captured, capturedCtx, preCutMessages);
+			: await summarizeCapturedChat(event, ctx, captured, capturedCtx, preCutMessages, prepareRequest);
 		return { compaction: createTextCompaction(prep, model, summary) };
 	};
 

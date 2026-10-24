@@ -4,12 +4,14 @@ import { randomUUID } from "node:crypto";
 import { type ExtensionAPI, type ExtensionContext, type SessionEntry, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import type { RequestPolicy } from "../request-policy.ts";
 import {
 	buildCodexHeaders,
 	buildCompactionRequestBody,
 	buildReplacementHistory,
 	buildToolPayload,
 	callRemoteCompaction,
+	codexCompactionHash,
 	compactionInputForBranch,
 	effectiveInputForBranch,
 	findNativeCheckpoint,
@@ -55,7 +57,7 @@ function setFeatureHeader(headers: Record<string, string | null>): void {
 	}
 }
 
-export function registerCodexCompaction(pi: ExtensionAPI) {
+export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: RequestPolicy) {
 	const payloadShapeBySession = new Map<string, CachedPayloadShape>();
 
 	pi.registerEntryRenderer<CompactionStatus>(COMPACTION_STATUS_KIND, (entry, _options, theme) => {
@@ -112,6 +114,7 @@ export function registerCodexCompaction(pi: ExtensionAPI) {
 			url: resolveCodexResponsesUrl(auth.baseUrl ?? params.model.baseUrl),
 			headers: buildCodexHeaders({ apiKey: auth.apiKey, headers: auth.headers, sessionId }),
 			body,
+			onPayload: (payload) => prepareRequest(payload, params.model),
 			model: params.model,
 			signal: params.signal ? AbortSignal.any([params.signal, timeout]) : timeout,
 		});
@@ -120,6 +123,7 @@ export function registerCodexCompaction(pi: ExtensionAPI) {
 				kind: NATIVE_COMPACTION_KIND,
 				version: NATIVE_COMPACTION_VERSION,
 				modelKey: modelKey(params.model),
+				compHash: codexCompactionHash(params.model),
 				replacementHistory: buildReplacementHistory(params.input, remote.compactionItem),
 			},
 			usage: remote.usage,

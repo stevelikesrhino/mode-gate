@@ -17,9 +17,8 @@ export function installFastFooter(
 
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		requestRender = () => tui.requestRender();
-		// Pi exposes the renderer, but not its live AgentSession through ctx.ui.
-		// Keep this adapter isolated: new native footer dependencies may require updates.
-		// Live getters prevent model/thinking changes from freezing at installation time.
+		// FooterComponent needs an AgentSession view; ctx exposes only its public state.
+		// Live getters keep model/thinking changes visible without reinstalling the footer.
 		const sessionView = {
 			get state() {
 				return { model: ctx.model, thinkingLevel: ctx.thinkingLevel };

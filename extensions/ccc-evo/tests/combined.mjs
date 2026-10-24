@@ -17,6 +17,7 @@ const native = await jiti.import(fileURLToPath(new URL("../codex/native-compacti
 const handlers = {};
 const renderers = {};
 const pi = {
+	registerCommand() {},
 	on(name, fn) { (handlers[name] ??= []).push(fn); },
 	registerEntryRenderer(name, fn) { renderers[name] = fn; },
 	getSettings: () => ({}),

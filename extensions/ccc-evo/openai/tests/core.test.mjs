@@ -1,4 +1,4 @@
-// Offline contracts only. Run: node --test extensions/pi-openai/tests/core.test.mjs
+// Offline contracts only. Run: node --test extensions/ccc-evo/openai/tests/core.test.mjs
 import assert from "node:assert/strict";
 import path from "node:path";
 import { test } from "node:test";
@@ -10,11 +10,12 @@ const jiti = createJiti(import.meta.url, {
 	fsCache: false,
 	alias: {
 		"@earendil-works/pi-coding-agent": path.join(root, "dist/index.js"),
+		"@earendil-works/pi-ai": path.join(root, "node_modules/@earendil-works/pi-ai/dist/index.js"),
 		"@earendil-works/pi-tui": path.join(root, "node_modules/@earendil-works/pi-tui/dist/index.js"),
 	},
 });
 const load = name => jiti.import(fileURLToPath(new URL(`../${name}.ts`, import.meta.url)));
-const { default: register } = await load("index");
+const { default: register } = await jiti.import(fileURLToPath(new URL("../../fast.ts", import.meta.url)));
 const { fetchUsage, parseUsage, UsageError } = await load("usage-api");
 const { registerUsage } = await load("usage");
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -33,6 +34,7 @@ function fixture(t) {
 	const handlers = new Map(), commands = new Map();
 	const f = {
 		branch: [], requests: [], token: jwt("test-account"), oauth: true,
+		runtime: { async prepareRequest(model, options = {}) { return { model, options }; } },
 		models: [{ id: "fixture", provider: "openai-codex", api: "openai-codex-responses" }],
 		respond: () => Response.json(payload()),
 	};
@@ -43,8 +45,9 @@ function fixture(t) {
 	});
 	f.ctx = {
 		mode: "print", model: f.models[0],
-		sessionManager: { getBranch: () => f.branch },
+		sessionManager: { getBranch: () => f.branch, getSessionId: () => t.name },
 		modelRegistry: {
+			runtime: f.runtime,
 			getAll: () => f.models,
 			isUsingOAuth: () => f.oauth,
 			getProviderAuth: t.mock.fn(async () => ({ auth: { apiKey: f.token } })),
@@ -73,6 +76,12 @@ function fixture(t) {
 		return result;
 	};
 	f.command = async (name, args = "") => { await commands.get(name).handler(args, f.ctx); await flush(); };
+	f.request = async payload => {
+		const model = f.ctx.model ?? {};
+		const prepared = await f.runtime.prepareRequest(model);
+		const replacement = await prepared.options.onPayload?.(payload, model);
+		return replacement === undefined ? payload : replacement;
+	};
 	f.key = async data => { assert.ok(f.input, "panel is open"); f.input(data); await flush(); };
 	f.turns = async count => { for (let i = 0; i < count; i++) await f.emit("agent_settled"); };
 	t.after(() => f.emit("session_shutdown"));
@@ -232,8 +241,8 @@ test("priority is opt-in, preserves payloads, and only affects supported models"
 	const f = fixture(t);
 	register(f.pi);
 	const payload = Object.freeze({ input: ["fixture"], stream: true, service_tier: "auto" });
-	const request = () => f.emit("before_provider_request", { payload });
-	assert.equal(await request(), undefined);
+	const request = () => f.request(payload);
+	assert.equal(await request(), payload);
 	for (const provider of ["openai", "openai-codex"]) {
 		for (const api of ["openai-responses", "openai-codex-responses", "openai-completions"]) {
 			f.ctx.model = { provider, api };
@@ -244,24 +253,25 @@ test("priority is opt-in, preserves payloads, and only affects supported models"
 	}
 	for (const model of [undefined, { provider: "other", api: "openai-responses" }, { provider: "openai", api: "other" }]) {
 		f.ctx.model = model;
-		assert.equal(await request(), undefined);
+		assert.equal(await request(), payload);
 	}
 	f.ctx.model = f.models[0];
 	for (const invalid of [null, [], "not-an-object"]) {
-		assert.equal(await f.emit("before_provider_request", { payload: invalid }), undefined);
+		assert.equal(await f.request(invalid), invalid);
 	}
 	await f.command("fast", "off");
-	assert.equal(await request(), undefined);
+	assert.equal(await request(), payload);
 	f.ctx.model = { provider: "other", api: "openai-responses" };
 	await f.command("fast", "on");
 	f.ctx.model = f.models[0];
-	assert.equal(await request(), undefined, "unsupported model could not enable priority");
+	assert.equal(await request(), payload, "unsupported model could not enable priority");
 });
 
 test("priority starts off for all session starts and never restores or writes saved fast state", async t => {
 	const f = fixture(t);
 	register(f.pi);
-	const request = () => f.emit("before_provider_request", { payload: { input: [] } });
+	const payload = { input: [] };
+	const request = () => f.request(payload);
 	const saved = { type: "custom", customType: "pi-openai:fast", data: { enabled: true } };
 	for (const reason of ["startup", "new", "resume", "reload", "fork"]) {
 		f.branch = reason === "new" ? [] : [saved];
@@ -271,9 +281,9 @@ test("priority starts off for all session starts and never restores or writes sa
 		assert.deepEqual(f.branch, before, "fast state must not be persisted");
 		await f.emit("session_start", { reason });
 		await f.command("fast", "status");
-		assert.equal(await request(), undefined, reason);
+		assert.equal(await request(), payload, reason);
 		await f.emit("session_tree");
-		assert.equal(await request(), undefined, "branch history cannot re-enable fast mode");
+		assert.equal(await request(), payload, "branch history cannot re-enable fast mode");
 	}
 });
 
@@ -310,7 +320,8 @@ test("red model label tracks the live priority gate and resets to Pi's native fo
 		f.footer = factory?.({ requestRender() {} }, theme, footerData);
 	};
 	register(f.pi);
-	const request = () => f.emit("before_provider_request", { payload: {} });
+	const payload = {};
+	const request = () => f.request(payload);
 	const assertRed = async () => {
 		assert.equal((await request()).service_tier, "priority");
 		const lines = f.footer.render(160), baseline = native.render(160);
@@ -321,7 +332,7 @@ test("red model label tracks the live priority gate and resets to Pi's native fo
 		assert.ok(lines[1].endsWith(theme.style(label, { fg: rgbColor(255, 0, 0) })));
 	};
 	const assertOff = async () => {
-		assert.equal(await request(), undefined);
+		assert.equal(await request(), payload);
 		assert.equal(f.footer, undefined, "Pi's built-in footer is restored");
 		assert.equal(watchers, 0);
 	};

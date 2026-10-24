@@ -22,8 +22,7 @@ interface TextCompactionDetails {
 }
 
 export function summaryOutputTokens(model: Model): number {
-	// No summary-specific ceiling. The SDK fits the model's output maximum to
-	// available context; a length stop retries with a shorter history prefix.
+	// Avoid a separate summary cap; limit retries shorten the history prefix instead.
 	return model.maxTokens > 0 ? model.maxTokens : model.contextWindow;
 }
 

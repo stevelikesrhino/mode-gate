@@ -26,7 +26,7 @@ const fixture = chain(Array.from({ length: 12 }, (_, i) => [
 	]),
 	{ role: "toolResult", toolCallId: `call_${i}|fc_${i}`, toolName: "bash", isError: false, timestamp: 3, content: [{ type: "text", text: `TOOL_${i}: ` + "t".repeat(12000) }] },
 ]).flat());
-const compact = registerCodexCompaction({ on() {}, registerEntryRenderer() {}, getAllTools: () => [], getActiveTools: () => [], appendEntry() {} });
+const compact = registerCodexCompaction({ on() {}, registerEntryRenderer() {}, getAllTools: () => [], getActiveTools: () => [], appendEntry() {} }, payload => payload);
 const jwt = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.signature`;
 const ctx = { model, mode: "print", hasUI: false, sessionManager: { getSessionId: () => "fixture" },
 	modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: jwt }) }, getSystemPrompt: () => "Fixture" };
