@@ -54,7 +54,7 @@ export async function harness(t, mutate) {
 	if (!mutate) {
 		// Exercise Pi's real extension loader, not just our registration mock.
 		const loaded = await loadExtensions([extensionPath], ctx.cwd);
-		assert.deepEqual(loaded.errors, [], "Pi could not load shorter-bash");
+		assert.deepEqual(loaded.errors, [], "Pi could not load shorter-ui");
 		loaded.runtime.getSettings = () => ({});
 		const extension = loaded.extensions[0];
 		handlers = extension.handlers;

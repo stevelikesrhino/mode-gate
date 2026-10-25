@@ -2,6 +2,7 @@
  * Extends Pi's bash with a required description; execution stays native.
  * Each call defaults to one status-colored `bash  description` line.
  * Click cycles short / native preview / expanded; Ctrl+O toggles all calls.
+ * Ctrl+T toggles native full thinking / a rolling one-line preview.
  */
 import { stripVTControlCharacters } from "node:util";
 import {
@@ -13,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, type Component, MouseRegion, Spacer, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { installRollingThinking } from "./thinking.js";
 
 type NativeBash = ReturnType<typeof createBashToolDefinition>;
 type NativeContext = Parameters<NonNullable<NativeBash["renderCall"]>>[2];
@@ -68,7 +70,8 @@ function clearNativeTimer(state: NativeContext["state"] | undefined): void {
 	timerState.interval = undefined;
 }
 
-export default function shorterBash(pi: ExtensionAPI): void {
+export default function shorterUI(pi: ExtensionAPI): void {
+	let restoreThinking: (() => void) | undefined;
 	const rows = new Set<RowState>();
 	const views = new Map<string, ViewMode>();
 
@@ -163,9 +166,17 @@ export default function shorterBash(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		clearRenderState();
+		restoreThinking?.();
+		restoreThinking = ctx.mode === "tui"
+			? installRollingThinking(() => ctx.ui.theme, () => pi.getSettings().outputPad === 0 ? 0 : 1)
+			: undefined;
 		registerBash(ctx);
 	});
 	pi.on("session_tree", clearRenderState);
 	pi.on("session_compact", clearRenderState);
-	pi.on("session_shutdown", clearRenderState);
+	pi.on("session_shutdown", () => {
+		clearRenderState();
+		restoreThinking?.();
+		restoreThinking = undefined;
+	});
 }
