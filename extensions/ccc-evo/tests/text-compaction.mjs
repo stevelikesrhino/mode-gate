@@ -218,10 +218,12 @@ test("HTTP errors, tool output, empty text, and truncated summaries never create
 		{ choices: [{ message: { content: "" }, finish_reason: "stop" }] },
 		f.success("length"),
 	]) {
-		f.responses.push(response);
+		const before = f.http.length;
+		f.responses.push(...Array.from({ length: 1 + 5 }, () => response instanceof Response ? response.clone() : response));
 		await assert.rejects(() => f.run());
+		assert.equal(f.http.length, before + 1 + 5, "initial attempt plus five retries with the same configuration before failure");
+		assert.deepEqual(f.http.at(-1).body, f.http[before].body);
 	}
-	assert.equal(f.http.length, 4);
 });
 
 test("limit backoff uses edited history, sums usage, and stops when no earlier cut remains", async t => {
@@ -348,11 +350,13 @@ test("Responses verifies captured prefixes, rejects refusals, and reconstructs d
 	assert.deepEqual(body.tools, JSON.parse(JSON.stringify(payload.tools)));
 	assert.equal(body.store, false);
 	assert.equal(body.stream, true);
-	f.responses.push(response([{ type: "response.refusal.delta", delta: "Refused" }]));
+	f.responses.push(...Array.from({ length: 1 + 5 }, () => response([{ type: "response.refusal.delta", delta: "Refused" }])));
+	const beforeRefusal = f.http.length;
 	await assert.rejects(() => f.run(), /refusal/);
+	assert.equal(f.http.length, beforeRefusal + 1 + 5, "retry invalid output without changing the captured prefix");
 	await f.capture({ ...payload, input: [{ role: "user", content: "Divergent" }] });
 	f.responses.push(response());
 	assert.ok((await f.run()).compaction);
-	assert.equal(f.http.length, 3, "divergent wire is replaced with a reconstructed request");
+	assert.equal(f.http.length, beforeRefusal + 1 + 5 + 1, "divergent wire is replaced with a reconstructed request");
 	assert.ok(!JSON.stringify(f.http.at(-1).body).includes("Divergent"));
 });

@@ -7,8 +7,9 @@
  * prompt/tool state without replaying request hooks. Limit retries shorten the
  * prefix by retaining more recent history.
  *
- * index.ts handles Codex dispatch and native-summary fallback. No partial
- * summary is saved; failed requests may still consume provider quota.
+ * Retry other failures with the last configuration before cancelling.
+ * index.ts handles Codex dispatch. No partial summary is saved; failed requests
+ * may still consume provider quota.
  */
 
 import { buildSessionProjection, convertToLlm, findCutPoint, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionBeforeCompactResult, type SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -115,7 +116,9 @@ const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response 
 const REQUEST_TIMEOUT_MS = 900_000;
 const RETRY_DELAY_MS = 2_000;
 const MAX_ATTEMPTS = 2;
-// Bound cache attempts independently of Pi's eventual native fallback.
+// Initial attempt plus five retries with the same configuration.
+const MAX_PROFILE_ATTEMPTS = 1 + 5;
+// Bound all capture, reconstruction, and retry work for this operation.
 const COMPACTION_TIMEOUT_MS = REQUEST_TIMEOUT_MS * MAX_ATTEMPTS;
 
 function requestSignal(signal: AbortSignal | null | undefined): AbortSignal {
@@ -916,11 +919,14 @@ export default function registerTextCompaction(pi: ExtensionAPI, prepareRequest:
 		return { compaction: createTextCompaction(prep, model, summary) };
 	};
 
-	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult> => {
+	return async (event: SessionBeforeCompactEvent, ctx: ExtensionContext): Promise<SessionBeforeCompactResult | undefined> => {
+		const api = ctx.model?.api;
+		if (api && api !== "openai-completions" && api !== "openai-responses" && api !== "anthropic-messages") return undefined;
 		let current = event;
 		let usage: Usage | undefined;
 		// Local to this compaction: the next operation always tries capture again.
 		let reconstruct = false;
+		let failedAttempts = 0;
 		const signal = AbortSignal.any([event.signal, AbortSignal.timeout(COMPACTION_TIMEOUT_MS)]);
 		for (;;) {
 			try {
@@ -932,33 +938,43 @@ export default function registerTextCompaction(pi: ExtensionAPI, prepareRequest:
 				signal.throwIfAborted();
 				if (err instanceof CacheAlignmentError && !reconstruct) {
 					reconstruct = true;
+					failedAttempts = 0;
 					warnCompaction(ctx, "Rebuilding the compaction request from saved state. Cache reuse is uncertain; this may cost more.");
 					log({ ev: "cache-miss", reason: err.message });
 					continue;
 				}
-				if (!(err instanceof CompactionLimitError)) throw err;
-				usage = addUsage(usage, err.usage);
-				let next: ReturnType<typeof prepareRetry> = undefined;
-				let keepRecentTokens = current.preparation.settings.keepRecentTokens;
-				// Skip repeated cuts: only send another request when the prefix shrinks.
-				do {
-					keepRecentTokens = keepRecentTokens > 0 ? keepRecentTokens * 2 : 8192;
-					if (!Number.isSafeInteger(keepRecentTokens)) break;
-					next = prepareRetry(current, keepRecentTokens);
-				} while (next && next.firstKeptEntryId === current.preparation.firstKeptEntryId);
-				const previousIndex = event.branchEntries.findIndex((entry) => entry.id === current.preparation.firstKeptEntryId);
-				const nextIndex = next ? event.branchEntries.findIndex((entry) => entry.id === next.firstKeptEntryId) : -1;
-				if (!next || nextIndex < 0 || nextIndex >= previousIndex) {
+				let error = err;
+				if (err instanceof CompactionLimitError) {
+					usage = addUsage(usage, err.usage);
+					let next: ReturnType<typeof prepareRetry> = undefined;
+					let keepRecentTokens = current.preparation.settings.keepRecentTokens;
+					// Skip repeated cuts: only change configuration when the prefix shrinks.
+					do {
+						keepRecentTokens = keepRecentTokens > 0 ? keepRecentTokens * 2 : 8192;
+						if (!Number.isSafeInteger(keepRecentTokens)) break;
+						next = prepareRetry(current, keepRecentTokens);
+					} while (next && next.firstKeptEntryId === current.preparation.firstKeptEntryId);
+					const previousIndex = event.branchEntries.findIndex((entry) => entry.id === current.preparation.firstKeptEntryId);
+					const nextIndex = next ? event.branchEntries.findIndex((entry) => entry.id === next.firstKeptEntryId) : -1;
+					if (next && nextIndex >= 0 && nextIndex < previousIndex) {
+						log({ ev: "limit-retry", keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
+						try {
+							if (ctx.hasUI) ctx.ui.notify(`Retrying cached compaction with ${next.settings.keepRecentTokens} recent tokens retained.`, "info");
+						} catch {
+							// Progress display must not affect compaction.
+						}
+						current = { ...event, preparation: next };
+						failedAttempts = 0;
+						continue;
+					}
 					log({ ev: "limit-exhausted", error: err.message, usage });
-					throw new Error(`cached backoff exhausted: ${err.message}`);
+					error = new Error(`cached backoff exhausted: ${err.message}`);
 				}
-				log({ ev: "limit-retry", keepRecentTokens: next.settings.keepRecentTokens, firstKeptEntryId: next.firstKeptEntryId, usage: err.usage });
-				try {
-					if (ctx.hasUI) ctx.ui.notify(`Retrying cached compaction with ${next.settings.keepRecentTokens} recent tokens retained.`, "info");
-				} catch {
-					// Progress display must not affect compaction.
-				}
-				current = { ...event, preparation: next };
+				if (++failedAttempts >= MAX_PROFILE_ATTEMPTS) throw error;
+				const reason = error instanceof Error ? error.message : String(error);
+				log({ ev: "profile-retry", attempt: failedAttempts + 1, reconstruct, firstKeptEntryId: current.preparation.firstKeptEntryId, error: reason });
+				warnCompaction(ctx, `Retrying compaction with the same configuration (${failedAttempts + 1}/${MAX_PROFILE_ATTEMPTS}): ${reason}`);
+				await delay(RETRY_DELAY_MS, signal);
 			}
 		}
 	};

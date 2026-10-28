@@ -30,8 +30,7 @@ export default function cccEvo(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		// Only ordinary text history may fall through to Pi's native summarizer.
-		let nativeFallback = false;
+		// Unsupported text APIs may yield to Pi; failures in our paths must not.
 		let signal: AbortSignal | undefined;
 		try {
 			signal = event.signal;
@@ -42,16 +41,12 @@ export default function cccEvo(pi: ExtensionAPI): void {
 				return { cancel: true };
 			}
 			if (codex) return await compactCodex(event, ctx) ?? { cancel: true };
-			nativeFallback = true;
 			return await compactText(event, ctx);
 		} catch (error) {
 			if (signal?.aborted) return { cancel: true };
 			const reason = error instanceof Error ? error.message : String(error);
-			warnCompaction(ctx, nativeFallback
-				? `Using Pi's native summary for this compaction: ${reason}`
-				: `Compaction cancelled: ${reason}`);
-			// No persistent fallback mode: every event starts with the cache route.
-			return nativeFallback ? undefined : { cancel: true };
+			warnCompaction(ctx, `Compaction cancelled: ${reason}`);
+			return { cancel: true };
 		}
 	});
 

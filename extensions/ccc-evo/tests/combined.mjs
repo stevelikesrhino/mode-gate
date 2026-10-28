@@ -276,17 +276,20 @@ for (const response of [
 	() => Response.json({ choices: [{ message: { content: "Partial summary" }, finish_reason: "length" }] }),
 ]) {
 	respond = response;
-	assert.equal(await handlers.session_before_compact[0](compactEvent(), regularCtx), undefined, "errors and exhausted limits yield to Pi's native summary");
+	const before = calls.length;
+	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), regularCtx), { cancel: true }, "errors and exhausted limits cancel without native fallback");
+	assert.equal(calls.length, before + 1 + 5, "initial attempt plus five retries with the last configuration");
+	assert.deepEqual(calls.at(-1).body, calls[before].body);
 }
 respond = successfulResponse;
 await capture(chat, regularCtx);
-assert.ok((await handlers.session_before_compact[0](compactEvent(), regularCtx)).compaction, "fallback is not sticky: next operation tries cache again");
+assert.ok((await handlers.session_before_compact[0](compactEvent(), regularCtx)).compaction, "failure is not sticky: next operation tries cache again");
 assert.deepEqual(await handlers.session_before_compact[0]({ ...compactEvent(), signal: AbortSignal.abort() }, regularCtx), { cancel: true }, "user abort never starts native fallback");
 
 const beforeExcluded = calls.length;
 const beforeAuth = authCalls;
 for (const api of ["openai-completions", "openai-responses"]) {
-	assert.equal(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), undefined, "missing capture and saved prompt yield to Pi");
+	assert.deepEqual(await handlers.session_before_compact[0](compactEvent(), { ...ctx, model: { ...model, provider: "openai", api } }), { cancel: true }, "missing capture and saved prompt cancel without native fallback");
 }
 assert.equal(calls.length, beforeExcluded);
 assert.equal(authCalls, beforeAuth);
@@ -375,4 +378,4 @@ await emitStats();
 for (const fn of handlers.session_shutdown) await fn({}, statsCtx);
 await tick();
 assert.equal(appended.length, 1, "stale checkpoint, session replacement, and shutdown suppress pending stats");
-console.log("Combined dispatcher, native fallback, Codex replay, opaque guards, branch-summary, and stats tests passed.");
+console.log("Combined dispatcher, same-configuration retries, Codex replay, opaque guards, branch-summary, and stats tests passed.");
