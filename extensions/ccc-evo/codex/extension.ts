@@ -2,7 +2,7 @@
 // Copyright (c) 2025 Can Celik. MIT license: ./LICENSE.
 import { randomUUID } from "node:crypto";
 import { type ExtensionAPI, type ExtensionContext, type SessionEntry, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, type Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import type { RequestPolicy } from "../request-policy.ts";
 import {
@@ -148,6 +148,15 @@ export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: Reques
 		};
 	});
 
+	pi.on("context_with_system", (event, ctx) => {
+		if (!isOpenAICodexModel(ctx.model) || findNativeCheckpoint(ctx.sessionManager.getBranch()).status === "none") return;
+		// Opaque replay starts a new prompt boundary. Resolve section/tool deltas
+		// before serialization, preserving request-local loadout changes as well.
+		const system = getCurrentSystemMessage(event.messages);
+		if (!system) return;
+		return { messages: [system, ...event.messages.filter((message) => message.role !== "system")] };
+	});
+
 	pi.on("before_provider_headers", (event, ctx) => {
 		if (!isOpenAICodexModel(ctx.model)) return;
 		setFeatureHeader(event.headers);
@@ -167,7 +176,15 @@ export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: Reques
 		try {
 			if (checkpoint.status === "none") return undefined;
 			const input = effectiveInputForBranch({ branch, model, tools: pi.getAllTools() });
-			const payload: JsonObject = { ...event.payload, input };
+			// Pi 1.4 declares tools in input (additional_tools), not necessarily
+			// payload.tools. Replace conversation history, never the wire loadout
+			// or developer instructions produced from the current system state.
+			const configuration = Array.isArray(event.payload.input) ? event.payload.input.filter((item) =>
+				isJsonObject(item) && (item.role === "system" || item.role === "developer" ||
+					item.type === "additional_tools" ||
+					((item.type === "tool_search_call" || item.type === "tool_search_output") && item.execution === "client")),
+			) : [];
+			const payload: JsonObject = { ...event.payload, input: [...configuration, ...input] };
 			delete payload.messages;
 			delete payload.previous_response_id;
 			return payload;
