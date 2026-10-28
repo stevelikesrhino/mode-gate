@@ -109,7 +109,10 @@ const UPDATE_PROMPT = `The messages above are NEW conversation messages to incor
 
 ${UPDATE_INSTRUCTIONS}`;
 
-const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response must be the summary text in the exact format above, with no explanations and no code fences.`;
+// Put the task switch in the final user message to leave the cached history prefix unchanged.
+const HANDOFF_INSTRUCTIONS = `Pause the ongoing task and directly output a text-only handoff summary of the conversation above in the format below. Do not continue the task, ask for confirmation, or call tools. Your only responsibility in this request is to generate summary text; the harness will handle storing it.`;
+
+const TOOL_PROHIBITION = `CRITICAL: Do not call any tools. Your entire response must be the summary text in the format above.`;
 
 // Per HTTP request, including its streamed body. Large summaries at high
 // reasoning effort can exceed five minutes.
@@ -260,7 +263,7 @@ function isOmittedAssistant(message: unknown): boolean {
 }
 
 function buildInstruction(previousSummary: string | undefined, customInstructions: string | undefined): string {
-	let text = previousSummary ? UPDATE_PROMPT : BASE_PROMPT;
+	let text = `${HANDOFF_INSTRUCTIONS}\n\n${previousSummary ? UPDATE_PROMPT : BASE_PROMPT}`;
 	if (previousSummary) {
 		text += `\n\n<previous-summary>\n${previousSummary}\n</previous-summary>`;
 	}
