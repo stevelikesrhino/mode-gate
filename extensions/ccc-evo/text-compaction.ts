@@ -478,32 +478,11 @@ export function warnCompaction(ctx: ExtensionContext, message: string): void {
 	}
 }
 
-function validateToolBoundary(messages: ReturnType<typeof convertToLlm>): void {
-	// Validate before SDK orphan repair can invent a missing result.
-	const pending = new Set<string>();
-	for (const message of messages) {
-		if (message.role === "system") continue;
-		if (message.role === "toolResult") {
-			if (!pending.delete(message.toolCallId)) throw new Error("unpaired tool result at summary boundary");
-		} else {
-			if (pending.size) throw new Error("unfinished tool turn at summary boundary");
-			if (message.role === "assistant") {
-				for (const block of message.content) {
-					if (block.type !== "toolCall") continue;
-					if (pending.has(block.id)) throw new Error("duplicate tool call at summary boundary");
-					pending.add(block.id);
-				}
-			}
-		}
-	}
-	if (pending.size) throw new Error("unfinished tool turn at summary boundary");
-}
-
 async function summarizeSdk(ctx: ExtensionContext, messages: ReturnType<typeof convertToLlm>, maxTokens: number, signal: AbortSignal,
 	onPayload: (generated: unknown) => JsonObject,
 	headers?: Record<string, string>, pi?: ExtensionAPI): Promise<{ text: string; usage: Usage }> {
 	const model = ctx.model!;
-	validateToolBoundary(messages);
+	// Interrupted or branched tool turns are normal; leave orphan repair to the SDK.
 	let invalidOutput = false;
 	let alignmentError: CacheAlignmentError | undefined;
 	const checkOutput = (item: unknown): void => {
