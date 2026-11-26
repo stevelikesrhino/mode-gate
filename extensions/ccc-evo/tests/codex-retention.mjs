@@ -85,7 +85,11 @@ try {
 	assert.ok(!JSON.stringify(replay(edit(restored, "e35", null))).includes("TOOL_11:"), "retained pre-checkpoint output may be omitted");
 	assert.throws(() => replay(edit(restored, "e0", null)), /history inside/);
 	assert.throws(() => replay([{ ...first.checkpoint, firstKeptEntryId: "missing" }]), /retained boundary/);
-	assert.throws(() => native.effectiveInputForBranch({ branch: restored, model: { ...model, id: "other" }, tools: [] }), /different model/);
+	assert.deepEqual(
+		native.effectiveInputForBranch({ branch: restored, model: { ...model, id: "other" }, tools: [] }),
+		replay(restored),
+		"switching Codex models preserves the checkpoint, encrypted reasoning, and item IDs",
+	);
 	assert.throws(() => native.compactionInputForBranch({ branch: fixture, model, tools: [], firstKeptEntryId: "missing" }), /retained boundary/);
 	assert.throws(() => native.compactionInputForBranch({ branch: fixture, model, tools: [], firstKeptEntryId: "e0" }), /no OpenAI Codex history/);
 	assert.equal(native.parseNativeCompactionDetails({ ...first.checkpoint.details, version: 99 }), undefined);

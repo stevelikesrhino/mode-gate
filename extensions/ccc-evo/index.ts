@@ -12,7 +12,7 @@ export default function cccEvo(pi: ExtensionAPI): void {
 	const compactCodex = registerCodexCompaction(pi, fastMode.prepareRequest);
 	const compactText = registerTextCompaction(pi, fastMode.prepareRequest);
 	registerCompactionStats(pi);
-	const opaqueError = "This branch contains an opaque Codex checkpoint. Use its original Codex model or return to the branch before compaction; it cannot be converted to a text summary.";
+	const opaqueError = "This branch contains an opaque checkpoint that only OpenAI Codex models can replay. Switch to Codex or return to a point before compaction.";
 	const notifyOpaque = (ctx: ExtensionContext): void => {
 		try {
 			if (ctx.hasUI) ctx.ui.notify(opaqueError, "error");

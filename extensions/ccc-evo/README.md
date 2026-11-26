@@ -48,7 +48,7 @@ Pi owns manual/automatic compaction timing and branch summarization. Use normal 
 
 `openai-codex` with `openai-codex-responses` uses the native remote opaque-checkpoint adapter, with a five-minute request timeout. Failures cancel without text/native-summary fallback. Existing checkpoints from the original npm extension remain readable.
 
-Cross-model replay requires known matching `comp_hash` values from the [model catalog](codex/native-compaction.ts) and preserves encrypted reasoning and associated item IDs. New checkpoints save the source hash; legacy checkpoints infer it from the catalog.
+Checkpoint replay allows switching between any `openai-codex` models using `openai-codex-responses`, preserving encrypted reasoning and associated item IDs.
 
 Opaque checkpoints cannot be translated into text. Incompatible or malformed checkpoints, and edits targeting history already absorbed into them, cancel the operation. Post-checkpoint tail edits remain supported.
 

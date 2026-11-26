@@ -229,16 +229,20 @@ assert.equal(aborted, beforeOpaqueAbort + 1, "opaque-history edit aborts the act
 const beforeOpaqueCompaction = calls.length;
 assert.deepEqual(await compact(), { cancel: true }, "opaque-history edit also cancels checkpoint replacement");
 assert.equal(calls.length, beforeOpaqueCompaction, "opaque-history edit fails before compaction network I/O");
-branch = [...checkpointBranch, entry("after", "cp", { ...userNext, content: "What token did I ask you to remember?" })];
 
 const differentModel = { ...ctx, model: { ...model, id: "other-codex-model" } };
-const beforeWrongModelAbort = aborted;
-await capture(originalPayload, differentModel, [marker, userNext]);
-assert.equal(aborted, beforeWrongModelAbort + 1, "wrong-model opaque checkpoint blocks continuation");
-const beforeFailure = calls.length;
+const oldHashedCheckpoint = { ...checkpoint, details: { ...checkpoint.details, compHash: "old-hash" } };
+branch = [...checkpointBranch.slice(0, -1), oldHashedCheckpoint, entry("after", "cp", userNext)];
+const beforeSwitchAbort = aborted;
+captured = await capture({ ...originalPayload, model: differentModel.model.id }, differentModel, [marker, userNext]);
+assert.equal(aborted, beforeSwitchAbort, "an unlisted Codex model can continue from a legacy checkpoint");
+assert.deepEqual(captured.payload.input.find((item) => item.type === "compaction"), opaque);
+const beforeSwitchCompact = calls.length;
 result = await handlers.session_before_compact[0](compactEvent(), differentModel);
-assert.deepEqual(result, { cancel: true });
-assert.equal(calls.length, beforeFailure, "mismatched checkpoint never reaches network");
+assert.equal(calls.length, beforeSwitchCompact + 1, "cross-model compaction reaches the Codex backend");
+assert.equal(calls.at(-1).body.model, differentModel.model.id);
+assert.equal(result.compaction.details.modelKey, native.modelKey(differentModel.model));
+assert.ok(!Object.hasOwn(result.compaction.details, "compHash"), "new checkpoints no longer record a model hash");
 
 branch = [entry("u", null, user), entry("a", "u", assistant), entry("tail", "a", userNext)];
 await capture(originalPayload);

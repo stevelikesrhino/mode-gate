@@ -17,24 +17,6 @@ export const RETAINED_USER_TOKEN_BUDGET = 64_000;
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const MAX_REMOTE_RETRIES = 2;
 
-// Exact IDs from OpenAI's Codex catalog; do not infer compatibility from model names.
-// https://github.com/openai/codex/blob/86e17e98c7/codex-rs/models-manager/models.json
-const CODEX_COMPACTION_HASHES = new Map<string, string>([
-	["gpt-6-astra", "3000"],
-	["gpt-6.1-sol", "3000"],
-	["gpt-6-sol", "3000"],
-	["gpt-6-luna", "3000"],
-	["gpt-5.6-sol", "3000"],
-	["gpt-5.6-terra", "3000"],
-	["gpt-5.6-luna", "3000"],
-	["gpt-daybreak-blue-latest", "3000"],
-	["gpt-daybreak-red-latest", "3000"],
-	["codex-auto-review", "3000"],
-	["gpt-5.5", "2911"],
-	// Also advertised by the ChatGPT Codex catalog captured on 2026-10-21.
-	["gpt-reserve", "3000"],
-]);
-
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
 
@@ -43,8 +25,6 @@ export interface NativeCompactionDetails {
 	/** v1 absorbed all pre-checkpoint history; v2 leaves Pi's retained tail outside it. */
 	version: 1 | typeof NATIVE_COMPACTION_VERSION;
 	modelKey: string;
-	/** Historical comp_hash; absent in checkpoints written before compatibility tracking. */
-	compHash?: string;
 	replacementHistory: ResponseItem[];
 }
 
@@ -77,23 +57,6 @@ export function modelKey(model: Pick<Model<any>, "provider" | "api" | "id">): st
 	return `${model.provider}:${model.api}:${model.id}`;
 }
 
-export function codexCompactionHash(model: Pick<Model<any>, "provider" | "api" | "id">): string | undefined {
-	return isOpenAICodexModel(model) ? CODEX_COMPACTION_HASHES.get(model.id) : undefined;
-}
-
-function isCheckpointModelCompatible(details: NativeCompactionDetails, model: Model<any>): boolean {
-	const prefix = "openai-codex:openai-codex-responses:";
-	if (!isOpenAICodexModel(model) || !details.modelKey.startsWith(prefix)) return false;
-	// Legacy checkpoints infer their source hash from the catalog, not historical metadata.
-	const sourceHash = details.compHash ?? CODEX_COMPACTION_HASHES.get(details.modelKey.slice(prefix.length));
-	const targetHash = codexCompactionHash(model);
-	if (details.modelKey === modelKey(model)) {
-		// Preserve same-model support for uncatalogued models, but reject a known hash change.
-		return sourceHash === undefined || targetHash === undefined || sourceHash === targetHash;
-	}
-	return sourceHash !== undefined && sourceHash === targetHash;
-}
-
 function cloneItem<T>(value: T): T {
 	return structuredClone(value);
 }
@@ -109,7 +72,6 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 	if (!isJsonObject(value)) return undefined;
 	if (value.kind !== NATIVE_COMPACTION_KIND || (value.version !== 1 && value.version !== NATIVE_COMPACTION_VERSION)) return undefined;
 	if (typeof value.modelKey !== "string" || !Array.isArray(value.replacementHistory)) return undefined;
-	if (value.compHash !== undefined && (typeof value.compHash !== "string" || !value.compHash.trim())) return undefined;
 
 	const replacementHistory = value.replacementHistory.filter(isResponseItem);
 	if (replacementHistory.length !== value.replacementHistory.length || replacementHistory.length === 0) return undefined;
@@ -126,7 +88,6 @@ export function parseNativeCompactionDetails(value: unknown): NativeCompactionDe
 		kind: NATIVE_COMPACTION_KIND,
 		version: value.version,
 		modelKey: value.modelKey,
-		...(typeof value.compHash === "string" ? { compHash: value.compHash } : {}),
 		replacementHistory: replacementHistory.map(cloneItem),
 	};
 }
@@ -228,7 +189,7 @@ function responseTool(tool: ToolInfo, deferLoading = false): JsonObject {
 
 function messagesToResponseItems(model: Model<any>, messages: Message[], tools: ToolInfo[]): ResponseItem[] {
 	const items: ResponseItem[] = [];
-	const targetHash = codexCompactionHash(model);
+	const isCodex = isOpenAICodexModel(model);
 	const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
 	const pendingToolCalls = new Map<string, string>();
 	const flushOrphanedToolCalls = () => {
@@ -250,11 +211,9 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				messageIndex++;
 				continue;
 			}
-			// Encrypted reasoning and related item IDs share one compatibility gate.
-			const sourceHash = typeof message.model === "string" ? CODEX_COMPACTION_HASHES.get(message.model) : undefined;
-			const canReplaySignatures = message.provider === model.provider && message.api === model.api && (
-				message.model === model.id || (targetHash !== undefined && sourceHash === targetHash)
-			);
+			// Codex replay keeps encrypted reasoning and item IDs across model switches.
+			const canReplaySignatures = message.provider === model.provider && message.api === model.api &&
+				(isCodex || message.model === model.id);
 			let textIndex = 0;
 			for (const block of message.content) {
 				if (!isJsonObject(block)) continue;
@@ -353,8 +312,8 @@ function replayHistoryForBranch(params: BranchInputParams): {
 		return { replacementHistory: [], entries: buildSessionProjection(branch).entries };
 	}
 	const checkpoint = lookup.checkpoint;
-	if (!isCheckpointModelCompatible(checkpoint.details, params.model)) {
-		throw new Error("The latest OpenAI Codex native compaction checkpoint belongs to a different model with an unknown or incompatible comp_hash.");
+	if (!isOpenAICodexModel(params.model) || !checkpoint.details.modelKey.startsWith("openai-codex:openai-codex-responses:")) {
+		throw new Error("Native compaction checkpoint replay requires OpenAI Codex Responses for both the source and selected models.");
 	}
 	let tailStart = checkpoint.entryIndex + 1;
 	if (checkpoint.details.version === 2) {
