@@ -43,7 +43,7 @@ export function installFastFooter(
 				requestRender = () => {};
 			},
 			invalidate() { inner.invalidate(); },
-			render(width: number): string[] {
+			render(width: number): readonly string[] {
 				inner.setAutoCompactEnabled(autoCompactEnabled());
 				const lines = inner.render(width);
 				// Use the same live gate as priority injection, including during model changes.
@@ -62,8 +62,10 @@ export function installFastFooter(
 				if (providerLabel.startsWith(label) || modelLabel.startsWith(label)) {
 					const prefixWidth = visibleWidth(plain.slice(0, plain.length - label.length));
 					const prefix = sliceByColumn(lines[1], 0, prefixWidth);
+					const recolored = [...lines];
 					// End the default footer's dim styling before applying red.
-					lines[1] = prefix + "\x1b[0m" + theme.style(label, { fg: FAST_RED });
+					recolored[1] = prefix + "\x1b[0m" + theme.style(label, { fg: FAST_RED });
+					return recolored;
 				}
 				return lines;
 			},

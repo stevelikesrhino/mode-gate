@@ -47,6 +47,11 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function reasoningEffort(item: JsonObject): string | undefined {
+	const { reasoning } = item;
+	return isJsonObject(reasoning) && typeof reasoning.effort === "string" ? reasoning.effort : undefined;
+}
+
 function setFeatureHeader(headers: Record<string, string | null>): void {
 	const existing = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-codex-beta-features");
 	if (existing) {
@@ -94,6 +99,7 @@ export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: Reques
 		basePayload?: JsonObject;
 		signal?: AbortSignal;
 	}): Promise<{ details: NativeCompactionDetails; usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"] }> => {
+		const thinkingLevel = params.ctx.thinkingLevel;
 		const auth = await params.ctx.modelRegistry.getApiKeyAndHeaders(params.model);
 		if (!auth.ok || !auth.apiKey) {
 			throw new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error);
@@ -103,6 +109,7 @@ export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: Reques
 		const body = buildCompactionRequestBody({
 			basePayload: params.basePayload,
 			model: params.model,
+			thinkingLevel,
 			input: params.input,
 			instructions: params.ctx.getSystemPrompt(),
 			tools: buildToolPayload(allTools, pi.getActiveTools()),
@@ -173,16 +180,29 @@ export function registerCodexCompaction(pi: ExtensionAPI, prepareRequest: Reques
 
 		try {
 			if (checkpoint.status === "none") return undefined;
-			const input = effectiveInputForBranch({ branch, model, tools: pi.getAllTools() });
-			// Pi 1.4 declares tools in input (additional_tools), not necessarily
-			// payload.tools. Replace conversation history, never the wire loadout
-			// or developer instructions produced from the current system state.
-			const configuration = Array.isArray(event.payload.input) ? event.payload.input.filter((item) =>
-				isJsonObject(item) && (item.role === "system" || item.role === "developer" ||
-					item.type === "additional_tools" ||
-					((item.type === "tool_search_call" || item.type === "tool_search_output") && item.execution === "client")),
-			) : [];
-			const payload: JsonObject = { ...event.payload, input: [...configuration, ...input] };
+			// Keep Pi's wire loadout and developer instructions ahead of the checkpoint.
+			// Effort changes belong in the retained conversation, not in that preamble.
+			const preamble: JsonObject[] = [];
+			let currentEffort: string | undefined;
+			for (const item of Array.isArray(event.payload.input) ? event.payload.input : []) {
+				if (!isJsonObject(item)) continue;
+				if (item.type === "configuration_update") {
+					currentEffort = reasoningEffort(item) ?? currentEffort;
+				} else if (item.role === "system" || item.role === "developer" || item.type === "additional_tools" ||
+					((item.type === "tool_search_call" || item.type === "tool_search_output") && item.execution === "client")) {
+					preamble.push(item);
+				}
+			}
+			const input = effectiveInputForBranch({
+				branch,
+				model,
+				tools: pi.getAllTools(),
+				effort: currentEffort === undefined ? undefined : {
+					baseline: reasoningEffort(event.payload),
+					current: currentEffort,
+				},
+			});
+			const payload: JsonObject = { ...event.payload, input: [...preamble, ...input] };
 			delete payload.messages;
 			delete payload.previous_response_id;
 			return payload;

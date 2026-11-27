@@ -7,7 +7,7 @@ import {
 	type SessionEntry,
 	type ToolInfo,
 } from "@earendil-works/pi-coding-agent";
-import { calculateCost, type Message, type Model, type Usage } from "@earendil-works/pi-ai";
+import { calculateCost, clampThinkingLevel, type Message, type Model, type ModelThinkingLevel, type Usage } from "@earendil-works/pi-ai";
 
 export const NATIVE_COMPACTION_KIND = "openai-codex-native-compaction";
 export const NATIVE_COMPACTION_VERSION = 2;
@@ -187,8 +187,16 @@ function responseTool(tool: ToolInfo, deferLoading = false): JsonObject {
 	};
 }
 
-function messagesToResponseItems(model: Model<any>, messages: Message[], tools: ToolInfo[]): ResponseItem[] {
+type ReplayEffort = { baseline: string | undefined; current: string };
+
+function messagesToResponseItems(model: Model<any>, messages: Message[], tools: ToolInfo[], effort?: ReplayEffort): ResponseItem[] {
 	const items: ResponseItem[] = [];
+	let lastEffort = effort?.baseline;
+	const updateEffort = (nextEffort: string, index: number) => {
+		if (nextEffort === lastEffort) return;
+		items.splice(index, 0, { type: "configuration_update", reasoning: { effort: nextEffort } });
+		lastEffort = nextEffort;
+	};
 	const isCodex = isOpenAICodexModel(model);
 	const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
 	const pendingToolCalls = new Map<string, string>();
@@ -212,8 +220,10 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 				continue;
 			}
 			// Codex replay keeps encrypted reasoning and item IDs across model switches.
-			const canReplaySignatures = message.provider === model.provider && message.api === model.api &&
-				(isCodex || message.model === model.id);
+			const sameProviderAndApi = message.provider === model.provider && message.api === model.api;
+			const sameModel = sameProviderAndApi && message.model === model.id;
+			const canReplaySignatures = sameModel || (sameProviderAndApi && isCodex);
+			const assistantStart = items.length;
 			let textIndex = 0;
 			for (const block of message.content) {
 				if (!isJsonObject(block)) continue;
@@ -258,6 +268,10 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 					});
 				}
 			}
+			// Pi anchors effort changes before nonempty output from this exact model.
+			if (effort && sameModel && items.length > assistantStart && typeof message.providerThinkingLevel === "string") {
+				updateEffort(message.providerThinkingLevel, assistantStart);
+			}
 		} else if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 			const [callId] = message.toolCallId.split("|");
 			pendingToolCalls.delete(message.toolCallId);
@@ -287,6 +301,7 @@ function messagesToResponseItems(model: Model<any>, messages: Message[], tools: 
 		messageIndex++;
 	}
 	flushOrphanedToolCalls();
+	if (effort) updateEffort(effort.current, items.length);
 
 	return items;
 }
@@ -344,10 +359,10 @@ function replayHistoryForBranch(params: BranchInputParams): {
 	};
 }
 
-export function effectiveInputForBranch(params: BranchInputParams): ResponseItem[] {
+export function effectiveInputForBranch(params: BranchInputParams & { effort?: ReplayEffort }): ResponseItem[] {
 	const { replacementHistory, entries } = replayHistoryForBranch(params);
 	const messages = convertToLlm(entries.flatMap((entry) => entry.messages));
-	return [...replacementHistory, ...messagesToResponseItems(params.model, messages, params.tools)];
+	return [...replacementHistory, ...messagesToResponseItems(params.model, messages, params.tools, params.effort)];
 }
 
 export function compactionInputForBranch(params: BranchInputParams & { firstKeptEntryId: string }): {
@@ -461,6 +476,7 @@ export function buildToolPayload(allTools: ToolInfo[], activeToolNames: string[]
 export function buildCompactionRequestBody(params: {
 	basePayload?: JsonObject;
 	model: Model<any>;
+	thinkingLevel?: ModelThinkingLevel;
 	input: ResponseItem[];
 	instructions: string;
 	tools?: unknown[];
@@ -487,6 +503,17 @@ export function buildCompactionRequestBody(params: {
 			? { verbosity: previousText.verbosity }
 			: { verbosity: "low" },
 	};
+	if (params.thinkingLevel !== undefined) {
+		// This standalone request does not carry the live transcript's effort updates.
+		const level = clampThinkingLevel(params.model, params.thinkingLevel);
+		const mapped = params.model.thinkingLevelMap?.[level];
+		if (!params.model.reasoning || mapped === null) {
+			delete body.reasoning;
+		} else {
+			const reasoning = isJsonObject(base.reasoning) ? base.reasoning : {};
+			body.reasoning = { ...reasoning, effort: mapped ?? (level === "off" ? "none" : level) };
+		}
+	}
 	if (params.tools) body.tools = params.tools;
 	else delete body.tools;
 	delete body.messages;
