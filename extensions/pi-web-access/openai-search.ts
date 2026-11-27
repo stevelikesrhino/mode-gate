@@ -21,6 +21,17 @@ interface OpenAIResponse {
 	output?: OutputItem[];
 }
 
+function maxToolCalls(): number {
+	const raw = process.env.PI_WEB_SEARCH_MAX_TOOL_CALLS?.trim();
+	if (!raw) return 3;
+
+	const limit = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(limit) || limit < 1) {
+		throw new Error("PI_WEB_SEARCH_MAX_TOOL_CALLS must be a positive integer.");
+	}
+	return limit;
+}
+
 export async function searchOpenAI(query: string, numResults: number, signal: AbortSignal): Promise<WebSearchResponse> {
 	const key = process.env.OAI_PLATFORM_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
 	if (!key) throw new Error("OpenAI web search requires OAI_PLATFORM_KEY or OPENAI_API_KEY.");
@@ -29,10 +40,10 @@ export async function searchOpenAI(query: string, numResults: number, signal: Ab
 		method: "POST",
 		headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
 		body: JSON.stringify({
-			model: "gpt-6-luna",
+			model: process.env.PI_WEB_SEARCH_MODEL?.trim() || "gpt-6-luna",
 			tools: [{ type: "web_search" }],
 			tool_choice: "required",
-			max_tool_calls: 1,
+			max_tool_calls: maxToolCalls(),
 			include: ["web_search_call.action.sources"],
 			store: false,
 			instructions: `Answer concisely with inline citations. Use up to ${numResults} sources.`,

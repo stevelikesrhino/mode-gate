@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { extractContent } from "./extract.js";
@@ -50,10 +50,21 @@ function truncateContent(content: string): { text: string; truncated: boolean } 
 	};
 }
 
+function renderSearchCell(
+	text: string,
+	theme: Theme,
+	{ isPartial, isError, outputPad }: { isPartial: boolean; isError: boolean; outputPad: number },
+): Text {
+	const background = isPartial ? "toolPendingBg" : isError ? "toolErrorBg" : "toolSuccessBg";
+	return new Text(text, outputPad, 0, (line) => theme.bg(background, line));
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
+		// Keep the colored padding inside Pi's native clickable tool region.
+		renderShell: "self",
 		description:
 			"Search the web and return a concise answer with source URLs. This is a basic web search tool; use fetch_content separately when you need the readable content from a specific result URL.",
 		promptSnippet:
@@ -97,20 +108,25 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 
-		renderCall(args, theme) {
+		renderCall(args, theme, context) {
 			const query = normalizeQuery((args as { query?: unknown }).query);
 			const display = query.length > 70 ? query.slice(0, 67) + "..." : query || "(no query)";
-			return new Text(theme.fg("toolTitle", theme.bold("web_search ")) + theme.fg(query ? "accent" : "error", display), 0, 0);
+			const heading = theme.fg("toolTitle", theme.bold("web_search ")) + theme.fg(query ? "accent" : "error", display);
+			return renderSearchCell(`\n${heading}${context.isPartial ? "\n" : ""}`, theme, context);
 		},
 
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as { error?: string; resultCount?: number };
-			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			const summary = theme.fg("success", `${details?.resultCount ?? 0} sources`);
-			if (!expanded) return new Text(summary, 0, 0);
+		renderResult(result, { expanded }, theme, context) {
+			const details = result.details as { error?: string; resultCount?: number } | undefined;
 			const text = result.content.find((c) => c.type === "text")?.text ?? "";
-			const preview = text.length > 500 ? text.slice(0, 500) + "..." : text;
-			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
+			if (details?.error || context.isError) {
+				const error = details?.error ? `Error: ${details.error}` : text || "Search failed.";
+				return renderSearchCell(theme.fg("error", error) + "\n", theme, context);
+			}
+			const count = details?.resultCount ?? 0;
+			const summary = theme.fg("success", `${count} ${count === 1 ? "source" : "sources"}`);
+			const toggle = theme.fg("muted", expanded ? "  [Hide results]" : "  [Show results]");
+			const output = expanded ? "\n\n" + theme.fg("toolOutput", truncateContent(text).text) : "";
+			return renderSearchCell(summary + toggle + output + "\n", theme, context);
 		},
 	});
 

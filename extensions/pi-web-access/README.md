@@ -10,6 +10,19 @@ This is a pruned derivative of [`nicobailon/pi-web-access`](https://github.com/n
 pi install npm:@stevelikesrhino/pi-web-access-pruned
 ```
 
+## Web search configuration
+
+- **Exa (default):** Leave `PI_WEB_SEARCH_PROVIDER` unset or set it to `exa`. `EXA_API_KEY` is optional.
+- **OpenAI:** Set `PI_WEB_SEARCH_PROVIDER=openai`. The extension reads `OAI_PLATFORM_KEY` first, then `OPENAI_API_KEY`. It does not fall back to Exa if the request fails.
+
+`PI_WEB_SEARCH_MODEL` selects the OpenAI model. It defaults to `gpt-6-luna` when unset or blank. The model must support `web_search` in the Responses API.
+
+`PI_WEB_SEARCH_MAX_TOOL_CALLS` limits hosted web search calls per OpenAI response. It defaults to **3** when unset or blank and accepts a positive whole number. Invalid values fail before a request is sent. It limits web actions such as searching or opening a page, not the number of sources shown. It has no effect on Exa.
+
+```bash
+PI_WEB_SEARCH_PROVIDER=openai PI_WEB_SEARCH_MODEL=gpt-5.4-mini PI_WEB_SEARCH_MAX_TOOL_CALLS=5 pi
+```
+
 ## Tools
 
 ### web_search
@@ -26,7 +39,7 @@ Parameters:
 | Parameter | Description |
 |-----------|-------------|
 | `query` | Search query |
-| `numResults` | Number of results to return, default 5, max 20 |
+| `numResults` | Maximum number of sources to list, default 5, range 1–20 |
 
 ### fetch_content
 
