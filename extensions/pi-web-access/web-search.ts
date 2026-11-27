@@ -1,3 +1,5 @@
+import { searchOpenAI } from "./openai-search.ts";
+
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -138,6 +140,10 @@ export async function searchWeb(
 	options: { numResults?: number; signal?: AbortSignal } = {},
 ): Promise<WebSearchResponse> {
 	const numResults = Math.max(1, Math.min(20, Math.floor(options.numResults ?? 5)));
+	const provider = process.env.PI_WEB_SEARCH_PROVIDER?.trim().toLowerCase() || "exa";
+	if (provider === "openai") return searchOpenAI(query, numResults, combineSignal(options.signal, DEFAULT_TIMEOUT_MS));
+	if (provider !== "exa") throw new Error("PI_WEB_SEARCH_PROVIDER must be exa or openai.");
+
 	const text = await callExaMcp(
 		"web_search_exa",
 		{

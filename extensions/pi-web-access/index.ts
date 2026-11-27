@@ -63,7 +63,7 @@ export default function (pi: ExtensionAPI) {
 			numResults: Type.Optional(Type.Integer({
 				minimum: 1,
 				maximum: 20,
-				description: "Number of search results to return (default: 5, max: 20)",
+				description: "Maximum number of sources to list (default: 5, max: 20)",
 			})),
 		}),
 
@@ -92,6 +92,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Error: ${message}` }],
 					details: { query, numResults, error: message },
+					isError: true,
 				};
 			}
 		},
