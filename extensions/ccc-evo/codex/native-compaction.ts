@@ -518,6 +518,8 @@ export function buildCompactionRequestBody(params: {
 	else delete body.tools;
 	delete body.messages;
 	delete body.previous_response_id;
+	// Let Codex choose the compaction budget; inherited reply caps can be below the 20,000-token minimum.
+	delete body.max_output_tokens;
 	return body;
 }
 
